@@ -33,7 +33,6 @@ DEFAULT_AI_PROFILE = (
 PREFERRED_AI_ENTITIES = (
     "ai_task.openai_ai_task",
     "ai_task.google_ai_task",
-    "ai_task.openai_evaluation",
 )
 
 
@@ -54,6 +53,7 @@ def _select_ai_entity(
         str(s.get("entity_id"))
         for s in (states if isinstance(states, list) else [])
         if str(s.get("entity_id", "")).startswith("ai_task.")
+        and (int((s.get("attributes") or {}).get("supported_features", 1) or 0) & 1)
     }
     for candidate in PREFERRED_AI_ENTITIES:
         if candidate in available:
@@ -85,6 +85,10 @@ def _call_ha_ai_task(task_name: str, instructions: str) -> str:
                 "instructions": instructions,
             },
         )
+        if not resp.is_success:
+            raise RuntimeError(
+                f"HA ai_task error ({resp.status_code}) from {entity_id}: {resp.text}"
+            )
         resp.raise_for_status()
         body = resp.json()
 

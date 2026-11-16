@@ -7,7 +7,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 import httpx
 from bs4 import BeautifulSoup
@@ -234,6 +234,292 @@ def _product_searchable_blob(product: dict[str, Any]) -> str:
     return f"{raw_blob} {compact_blob}"
 
 
+SWEDISH_NOISE_WORDS_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"80\+\s*(?:gold|bronze|silver|platinum|titanium)|"
+    r"atx\s*3\.[01]|pcie\s*[45]\.0|m\.2|"
+    r"[23]-pack|midi-tower|mid\s+tower|"
+    r"svart|vit|grå|silver|blå|röd|grön|rosa|guld|"
+    r"chassi|miditower|fulltower|minitower|"
+    r"spelmus|gamingmus|datormus|trådlös|trådlösa|trådbunden|"
+    r"mekaniskt|mekanisk|tangentbord|nätaggregat|"
+    r"helmodulär|helmodulärt|halvmodulär|halvmodulärt|modulärt|"
+    r"grafikkort|bildskärm|gamingskärm|datorskärm|processor|moderkort|"
+    r"internminne|hårddisk|fläkt|vattenkylning|processorkylare|"
+    r"hörlurar|headset|webbkamera|projektor|pack|"
+    r"inkl|med|för|dator|series|nvme"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def clean_review_search_query(
+    name: str,
+    brand: str | None = None,
+    model: str | None = None,
+) -> str:
+    """Produce a clean international product query from Swedish retail product names."""
+    raw = str(name or "").strip()
+    if not raw:
+        raw = " ".join(p.strip() for p in (brand or "", model or "") if p and p.strip())
+    raw = re.sub(r"\([^)]*\)", " ", raw)
+    raw = re.sub(r"\s+-\s+.*$", "", raw)
+    cleaned = SWEDISH_NOISE_WORDS_RE.sub(" ", raw)
+    cleaned = re.sub(r"\b(\d+)\s+\1(w|gb|tb|mm|hz)\b", r"\1\2", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-/")
+    if not cleaned:
+        cleaned = str(name or model or brand or "").strip()
+
+    brand_clean = str(brand or "").strip()
+    if brand_clean and brand_clean.lower() not in cleaned.lower():
+        cleaned = f"{brand_clean} {cleaned}".strip()
+
+    words = cleaned.split()
+    return " ".join(words[:7])
+
+
+def build_external_review_links(
+    name: str,
+    *,
+    brand: str | None = None,
+    model: str | None = None,
+    category: str | None = None,
+) -> list[dict[str, str]]:
+    """Build category-aware direct search links to specialist independent hardware review sites."""
+    q = clean_review_search_query(name, brand, model)
+    q_enc = quote_plus(q)
+    hay = f"{category or ''} {name}".lower()
+
+    links: list[dict[str, str]] = []
+    if any(k in hay for k in ("nätaggregat", "nataggregat", "80+", "atx 3")) or re.search(
+        r"\bpsu\b", hay
+    ):
+        links = [
+            {
+                "site": "Hardware Busters",
+                "url": f"https://hwbusters.com/?s={q_enc}",
+                "query": q,
+                "focus": "Oscilloskop, transienter, ATX 3.1 & ljudprofil",
+            },
+            {
+                "site": "Cybenetics",
+                "url": f"https://www.google.com/search?q={quote_plus('site:cybenetics.com ' + q)}",
+                "query": q,
+                "focus": "Oberoende ETA-effektivitet & LAMBDA-ljudbetyg",
+            },
+            {
+                "site": "TechPowerUp",
+                "url": f"https://www.techpowerup.com/review/?q={q_enc}",
+                "query": q,
+                "focus": "Kondensatortest, rippel & verkningsgrad",
+            },
+        ]
+    elif any(k in hay for k in ("skärm", "skarm", "monitor")):
+        links = [
+            {
+                "site": "RTINGS",
+                "url": f"https://www.rtings.com/search?q={q_enc}",
+                "query": q,
+                "focus": "Labbmätning: svarstid, ljusstyrka, kontrast & HDR",
+            },
+            {
+                "site": "TFTCentral",
+                "url": f"https://tftcentral.co.uk/?s={q_enc}",
+                "query": q,
+                "focus": "Djupgående panelanalys, kalibrering & rörelseskärpa",
+            },
+            {
+                "site": "TechPowerUp",
+                "url": f"https://www.techpowerup.com/review/?q={q_enc}",
+                "query": q,
+                "focus": "Färgomfång, OSD & input lag",
+            },
+        ]
+    elif any(k in hay for k in ("projektor", "tv & bild")) or re.search(r"\btv\b", hay):
+        links = [
+            {
+                "site": "RTINGS",
+                "url": f"https://www.rtings.com/search?q={q_enc}",
+                "query": q,
+                "focus": "Labbmätning: HDR-toppljusstyrka, svärta & HDMI 2.1",
+            },
+            {
+                "site": "FlatpanelsHD",
+                "url": f"https://www.google.com/search?q={quote_plus('site:flatpanelshd.com ' + q)}",
+                "query": q,
+                "focus": "Nordiska/EU TV-modeller, panelteknik & kalibrering",
+            },
+        ]
+    elif any(
+        k in hay
+        for k in (
+            "headset",
+            "ljud",
+            "hörlur",
+            "tangentbord",
+            "webbkamera",
+            "gamingmus",
+            "spelmus",
+        )
+    ) or re.search(r"\b(?:möss|mus|mouse)\b", hay):
+        links = [
+            {
+                "site": "RTINGS",
+                "url": f"https://www.rtings.com/search?q={q_enc}",
+                "query": q,
+                "focus": "Frekvenskurva, ANC, klicklatens & sensortester",
+            },
+            {
+                "site": "TechPowerUp",
+                "url": f"https://www.techpowerup.com/review/?q={q_enc}",
+                "query": q,
+                "focus": "Switchar, byggkvalitet & sensorprestanda",
+            },
+        ]
+    elif any(k in hay for k in ("lagring", "nvme", "microsd")) or re.search(
+        r"\b(?:ssd|hdd)\b", hay
+    ):
+        links = [
+            {
+                "site": "TechPowerUp",
+                "url": f"https://www.techpowerup.com/review/?q={q_enc}",
+                "query": q,
+                "focus": "Kontroller/NAND-ID, DRAM-cache & termisk strypning",
+            },
+            {
+                "site": "Tom's Hardware",
+                "url": f"https://www.tomshardware.com/search?searchTerm={q_enc}",
+                "query": q,
+                "focus": "Sustained write, slumpläsning & uthållighet",
+            },
+        ]
+    elif any(k in hay for k in ("bärbara", "barbara", "laptop", "mobil", "wearable")):
+        links = [
+            {
+                "site": "Notebookcheck",
+                "url": f"https://www.google.com/search?q={quote_plus('site:notebookcheck.net ' + q)}",
+                "query": q,
+                "focus": "Skärm-PWM, batteritid, fläktljud & TDP-gränser",
+            },
+        ]
+        if any(k in hay for k in ("mobil", "wearable")):
+            links.append(
+                {
+                    "site": "GSMArena",
+                    "url": f"https://www.gsmarena.com/res.php3?sSearch={q_enc}",
+                    "query": q,
+                    "focus": "Batteriuthållighet, kameratester & skärmnits",
+                }
+            )
+        else:
+            links.append(
+                {
+                    "site": "RTINGS",
+                    "url": f"https://www.rtings.com/search?q={q_enc}",
+                    "query": q,
+                    "focus": "Skärmkalibrering, tangentbord & batteritest",
+                }
+            )
+    elif any(k in hay for k in ("nätverk", "natverk", "wi-fi", "smarta hemmet")) or re.search(
+        r"\b(?:router|mesh|wifi|iot)\b", hay
+    ):
+        links = [
+            {
+                "site": "Dong Knows Tech",
+                "url": f"https://dongknows.com/?s={q_enc}",
+                "query": q,
+                "focus": "Verklig Wi-Fi-genomströmning, räckvidd & mesh-tester",
+            },
+            {
+                "site": "M3.se",
+                "url": f"https://www.google.com/search?q={quote_plus('site:m3.idg.se ' + q)}",
+                "query": q,
+                "focus": "Svenska tester av nätverk & smarta hemmet",
+            },
+        ]
+    elif any(k in hay for k in ("foto", "kamera")):
+        links = [
+            {
+                "site": "DPReview",
+                "url": f"https://www.dpreview.com/search?query={q_enc}",
+                "query": q,
+                "focus": "Studioscener, dynamiskt omfång & autofokus",
+            },
+            {
+                "site": "RTINGS",
+                "url": f"https://www.rtings.com/search?q={q_enc}",
+                "query": q,
+                "focus": "Brusprestanda, video-rolling shutter & objektiv",
+            },
+        ]
+    elif any(
+        k in hay
+        for k in (
+            "grafikkort",
+            "processor",
+            "moderkort",
+            "kyl",
+            "chassi",
+            "minne",
+            "fläkt",
+            "datorkomponenter",
+        )
+    ):
+        links = [
+            {
+                "site": "TechPowerUp",
+                "url": f"https://www.techpowerup.com/review/?q={q_enc}",
+                "query": q,
+                "focus": "Kylarbuller, VRM-temperaturer & PCB-analys",
+            },
+            {
+                "site": "Tom's Hardware",
+                "url": f"https://www.tomshardware.com/search?searchTerm={q_enc}",
+                "query": q,
+                "focus": "Spelprestanda, temperaturer & prestanda per krona",
+            },
+            {
+                "site": "GamersNexus",
+                "url": f"https://www.youtube.com/results?search_query={quote_plus('GamersNexus ' + q)}",
+                "query": q,
+                "focus": "Standardiserad termisk & ljudnivåtest",
+            },
+        ]
+    else:
+        links = [
+            {
+                "site": "RTINGS",
+                "url": f"https://www.rtings.com/search?q={q_enc}",
+                "query": q,
+                "focus": "Objektiva labbmätningar och betyg",
+            },
+            {
+                "site": "TechPowerUp",
+                "url": f"https://www.techpowerup.com/review/?q={q_enc}",
+                "query": q,
+                "focus": "Tekniska djupgranskningar av hårdvara",
+            },
+        ]
+
+    links.append(
+        {
+            "site": "SweClockers",
+            "url": f"https://www.sweclockers.com/sok?q={q_enc}",
+            "query": q,
+            "focus": "Svenska recensioner & forumdiskussioner",
+        }
+    )
+    links.append(
+        {
+            "site": "YouTube Review",
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(q + ' review')}",
+            "query": q,
+            "focus": "Videotester, genomgångar & verkliga jämförelser",
+        }
+    )
+    return links
+
+
 class PrisGeekClient:
     """Client for querying PrisGeek via Supabase PostgREST and SSR HTML/TSR endpoints."""
 
@@ -374,7 +660,11 @@ class PrisGeekClient:
 
             cat_obj = row.get("categories")
             category_name = cat_obj.get("name") if isinstance(cat_obj, dict) else None
+            effective_category = category_name or row.get("subcategory")
             public_id = row.get("public_id")
+            clean_query = clean_review_search_query(
+                name, row.get("brand"), row.get("model")
+            )
             results.append(
                 {
                     "public_id": public_id,
@@ -383,7 +673,7 @@ class PrisGeekClient:
                     "brand": row.get("brand"),
                     "model": row.get("model"),
                     "mpn": row.get("mpn"),
-                    "category": category_name or row.get("subcategory"),
+                    "category": effective_category,
                     "url": self._format_product_url(public_id, row.get("slug")),
                     "lowest_price": lowest_price,
                     "lowest_total_price": summary["lowest_total_price"],
@@ -392,6 +682,13 @@ class PrisGeekClient:
                     "offer_count": summary["offer_count"],
                     "specs": row.get("specs"),
                     "offers": summary["offers"][:3],
+                    "clean_model_query": clean_query,
+                    "external_review_links": build_external_review_links(
+                        name,
+                        brand=row.get("brand"),
+                        model=row.get("model"),
+                        category=effective_category,
+                    ),
                 }
             )
 
@@ -558,7 +855,9 @@ class PrisGeekClient:
 
         cat_obj = row.get("categories")
         category_name = cat_obj.get("name") if isinstance(cat_obj, dict) else None
+        effective_category = category_name or row.get("subcategory")
         extra_context = self.get_product_extra_context(row.get("id"), pid)
+        product_name = str(row.get("name") or "")
 
         return {
             "public_id": pid,
@@ -567,7 +866,7 @@ class PrisGeekClient:
             "brand": row.get("brand"),
             "model": row.get("model"),
             "mpn": row.get("mpn"),
-            "category": category_name or row.get("subcategory"),
+            "category": effective_category,
             "url": product_url,
             "image_url": row.get("image_url"),
             "lowest_price": lowest_price,
@@ -583,6 +882,15 @@ class PrisGeekClient:
             "specs": row.get("specs"),
             "offers": summary["offers"],
             "extra_context": extra_context,
+            "clean_model_query": clean_review_search_query(
+                product_name, row.get("brand"), row.get("model")
+            ),
+            "external_review_links": build_external_review_links(
+                product_name,
+                brand=row.get("brand"),
+                model=row.get("model"),
+                category=effective_category,
+            ),
         }
 
     def get_product_extra_context(

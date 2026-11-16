@@ -143,6 +143,7 @@ def analyze_product_deal(
         "name": details["name"],
         "brand": details.get("brand"),
         "category": details.get("category"),
+        "clean_model_query": details.get("clean_model_query"),
         "current_lowest_price_sek": details.get("lowest_price"),
         "best_retailer": details.get("best_retailer"),
         "lowest_30d_price_sek": details.get("lowest_30d_price"),
@@ -154,6 +155,7 @@ def analyze_product_deal(
         "specs": details.get("specs"),
         "sweclockers_reviews": extra.get("reviews") or [],
         "sweclockers_member_deals": extra.get("member_deals") or [],
+        "external_review_links": details.get("external_review_links") or [],
         "user_requirements": ai_requirements or "Inga extra krav angivna.",
     }
 
@@ -165,6 +167,7 @@ def analyze_product_deal(
         '- "verdict_badge": exakt en av "Köp direkt 🔥", "Bra köp ✅", "Avvakta ⏳", "Undvik ⚠️"\n'
         '- "buy_or_wait": 1-2 korta meningar på svenska om priset mot 30d/all-time och butiksspridning\n'
         '- "spec_check": 1-2 korta meningar på svenska om specifikationer, kvalitet, SweClockers-omdömen och om user_requirements uppfylls\n'
+        '- "review_consensus": 1-2 korta meningar på svenska om vad oberoende testare (t.ex. RTINGS, TechPowerUp, Hardware Busters, Notebookcheck, SweClockers) brukar lyfta fram om denna modell/produktserie (styrkor, svagheter och ev. fallgropar)\n'
         '- "matches_requirements": boolean (true om inga angivna user_requirements bryts)\n'
         '- "short_summary": 1 mycket kort mening på svenska anpassad för mobilnotis\n\n'
         f"Produktdata:\n{json.dumps(context_payload, ensure_ascii=False)}"
@@ -180,8 +183,10 @@ def analyze_product_deal(
         "verdict_badge": str(parsed.get("verdict_badge") or "Avvakta ⏳"),
         "buy_or_wait": str(parsed.get("buy_or_wait") or ""),
         "spec_check": str(parsed.get("spec_check") or ""),
+        "review_consensus": str(parsed.get("review_consensus") or ""),
         "matches_requirements": bool(parsed.get("matches_requirements", True)),
         "short_summary": str(parsed.get("short_summary") or ""),
+        "external_review_links": details.get("external_review_links") or [],
         "public_id": details["public_id"],
         "product_name": details["name"],
         "current_price": details.get("lowest_price"),

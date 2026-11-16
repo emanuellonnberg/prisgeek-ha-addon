@@ -238,6 +238,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .badge-red { background: var(--red-bg); color: #fca5a5; }
     .badge-purple { background: var(--purple-bg); color: #d8b4fe; }
     .badge-muted { background: var(--surface-2); color: var(--muted); }
+    .review-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    a.badge-review {
+      background: rgba(56, 189, 248, 0.12);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.28);
+      text-decoration: none;
+    }
+    a.badge-review:hover {
+      background: rgba(56, 189, 248, 0.22);
+      border-color: var(--accent);
+      text-decoration: none;
+    }
+    .review-links-compact {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 4px;
+    }
+    .review-links-compact a.badge-review {
+      font-size: 0.7rem;
+      padding: 2px 6px;
+    }
 
     .deals-grid {
       display: grid;
@@ -779,6 +807,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </svg>`;
     }
 
+    function renderReviewLinksHtml(links, sweReviews = [], compact = false) {
+      const sweBadges = (sweReviews || []).map(r => {
+        const label = `SweClockers: ${r.award_label || r.title}`;
+        return r.url
+          ? `<a class="badge badge-purple" style="text-decoration:none;" href="${esc(r.url)}" target="_blank" rel="noopener" title="${esc(r.title || label)}">${esc(label)} ↗</a>`
+          : `<span class="badge badge-purple">${esc(label)}</span>`;
+      });
+      const extBadges = (links || []).map(l => {
+        const tooltip = `${l.focus || ""}${l.query ? ` (Sökning: ${l.query})` : ""}`.trim();
+        return `<a class="badge badge-review" href="${esc(l.url)}" target="_blank" rel="noopener" title="${esc(tooltip)}">${esc(l.site)} ↗</a>`;
+      });
+      if (!sweBadges.length && !extBadges.length) return "";
+      if (compact) {
+        return `<div class="review-links-compact">${extBadges.join("")}</div>`;
+      }
+      return `<div class="review-links"><span class="subtext" style="margin:0 4px 0 0;">Tester &amp; Recensioner:</span>${sweBadges.join("")}${extBadges.join("")}</div>`;
+    }
+
     function renderAiVerdictHtml(v) {
       if (!v || !v.verdict_badge) return "";
       const score = Number(v.score || 0);
@@ -791,6 +837,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <div style="font-size:0.88rem; margin-bottom:4px;"><strong>Pris &amp; Köpråd:</strong> ${esc(v.buy_or_wait)}</div>
           <div style="font-size:0.88rem;"><strong>Spec &amp; Krav:</strong> ${esc(v.spec_check)}</div>
+          ${v.review_consensus ? `<div style="font-size:0.88rem; margin-top:4px;"><strong>Tester &amp; Recensioner:</strong> ${esc(v.review_consensus)}</div>` : ""}
         </div>`;
     }
 
@@ -852,7 +899,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <a href="${esc(det.url)}" target="_blank" rel="noopener">Öppna på PrisGeek ↗</a>
             <button class="btn-primary btn-sm" type="button" onclick="runAiAnalyzeProduct(${Number(publicId)}, ${targetPrice !== null ? Number(targetPrice) : "null"}, ${watchId !== null ? Number(watchId) : "null"})">Kör AI-analys</button>
           </div>
-          ${reviews.length ? `<div style="margin-bottom:10px;">${reviews.map(r => `<span class="badge badge-purple" style="margin-right:6px;">SweClockers: ${esc(r.award_label || r.title)}</span>`).join("")}</div>` : ""}
+          ${renderReviewLinksHtml(det.external_review_links || [], reviews, false)}
           <div id="detail-ai-box">${cachedVerdict}</div>
           <div style="margin-bottom:14px;">${chartSvg}</div>
           <h4 style="margin:10px 0 6px;">Butikserbjudanden (${offers.length})</h4>
@@ -1627,7 +1674,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <tbody>
               ${items.map((item, idx) => `
                 <tr>
-                  <td><a href="${esc(item.url)}" target="_blank" rel="noopener">${esc(item.name)}</a></td>
+                  <td>
+                    <a href="${esc(item.url)}" target="_blank" rel="noopener">${esc(item.name)}</a>
+                    ${renderReviewLinksHtml(item.external_review_links || [], [], true)}
+                  </td>
                   <td>${esc(item.brand || "–")}</td>
                   <td><strong>${fmtKr(item.lowest_price)}</strong></td>
                   <td>${fmtKr(item.lowest_total_price)}</td>

@@ -7,7 +7,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -58,8 +58,31 @@ PRODUCT_SELECT = (
     "id,public_id,slug,name,brand,model,image_url,mpn,specs,release_date,"
     "category_id,subcategory,categories(slug,name),"
     "offers(id,price,list_price,shipping,stock_status,retailer_id,condition,"
-    "delivery_days,retailers(name,slug,dispatch_country))"
+    "delivery_days,url,retailers(name,slug,dispatch_country))"
 )
+
+
+def unwrap_store_url(raw_url: str | None) -> str | None:
+    """Resolve relative store links and unwrap affiliate wrapper URLs when inner URL is present."""
+    if not raw_url:
+        return None
+    cleaned = str(raw_url).strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("/") or cleaned.startswith("//"):
+        cleaned = urljoin(PRISGEEK_BASE, cleaned)
+    if not cleaned.startswith(("http://", "https://")):
+        return None
+    try:
+        query_params = parse_qs(urlsplit(cleaned).query)
+        for key in ("url", "target", "u"):
+            for candidate in query_params.get(key, []):
+                cand = str(candidate).strip()
+                if cand.startswith(("http://", "https://")):
+                    return cand
+    except Exception:
+        pass
+    return cleaned
 
 
 def parse_sek(text: str | None) -> float | None:
@@ -178,6 +201,7 @@ def summarize_offers(
                 "in_stock": in_stock,
                 "condition": condition or "new",
                 "delivery_days": offer.get("delivery_days"),
+                "store_url": unwrap_store_url(offer.get("url")),
             }
         )
 
@@ -197,6 +221,7 @@ def summarize_offers(
         "lowest_price": best_offer["price"] if best_offer else None,
         "lowest_total_price": round(lowest_total, 2) if lowest_total is not None else None,
         "best_retailer": best_offer["retailer_name"] if best_offer else None,
+        "best_store_url": best_offer.get("store_url") if best_offer else None,
         "in_stock": bool(in_stock_offers),
     }
 
@@ -678,6 +703,7 @@ class PrisGeekClient:
                     "lowest_price": lowest_price,
                     "lowest_total_price": summary["lowest_total_price"],
                     "best_retailer": summary["best_retailer"],
+                    "best_store_url": summary["best_store_url"],
                     "in_stock": summary["in_stock"],
                     "offer_count": summary["offer_count"],
                     "specs": row.get("specs"),
@@ -872,6 +898,7 @@ class PrisGeekClient:
             "lowest_price": lowest_price,
             "lowest_total_price": summary["lowest_total_price"],
             "best_retailer": summary["best_retailer"],
+            "best_store_url": summary["best_store_url"],
             "in_stock": summary["in_stock"],
             "offer_count": summary["offer_count"],
             "lowest_30d_price": lowest_30d,
@@ -1124,7 +1151,7 @@ class PrisGeekClient:
                     "score": score,
                     "tipster": row.get("tipster") or "",
                     "note": row.get("note") or "",
-                    "store_url": row.get("url") or "",
+                    "store_url": unwrap_store_url(row.get("url")) or "",
                     "forum_url": row.get("forum_url") or "",
                     "product_url": product_url or row.get("url") or f"{PRISGEEK_BASE}/medlemsfynd",
                     "posted_at": row.get("posted_at") or row.get("first_seen_at"),
@@ -1183,6 +1210,7 @@ class PrisGeekClient:
                     continue
 
             till_links = row.select('a[href*="/api/public/till-butik"]')
+            store_href = till_links[0].get("href") if till_links else None
             price: float | None = None
             retailer = "Okänd butik"
             for tl in till_links:
@@ -1228,6 +1256,7 @@ class PrisGeekClient:
                     "public_id": pid,
                     "name": name,
                     "url": urljoin(PRISGEEK_BASE, href),
+                    "store_url": unwrap_store_url(str(store_href) if store_href else None) or "",
                     "price": round(price, 2),
                     "new_price": new_price,
                     "discount_pct": discount_pct,
@@ -1265,6 +1294,7 @@ class PrisGeekClient:
                             "public_id": pid,
                             "name": item["name"],
                             "url": item["url"],
+                            "store_url": item.get("best_store_url") or "",
                             "price": item["lowest_price"],
                             "new_price": None,
                             "discount_pct": None,

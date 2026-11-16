@@ -259,16 +259,26 @@ def send_price_alert(alert_data: dict[str, Any], *, dry_run: bool = False) -> di
                     "message": message,
                 }
                 if service.startswith("mobile_app_") and alert_data.get("url"):
+                    actions: list[dict[str, str]] = []
+                    if alert_data.get("store_url"):
+                        actions.append(
+                            {
+                                "action": "URI",
+                                "title": f"Köp hos {alert_data.get('retailer') or 'butik'}",
+                                "uri": alert_data["store_url"],
+                            }
+                        )
+                    actions.append(
+                        {
+                            "action": "URI",
+                            "title": "Öppna på PrisGeek",
+                            "uri": alert_data["url"],
+                        }
+                    )
                     service_payload["data"] = {
                         "url": alert_data["url"],
                         "clickAction": alert_data["url"],
-                        "actions": [
-                            {
-                                "action": "URI",
-                                "title": "Öppna på PrisGeek",
-                                "uri": alert_data["url"],
-                            }
-                        ],
+                        "actions": actions,
                     }
                 try:
                     resp = client.post(
@@ -351,6 +361,7 @@ def push_ha_sensors(watches: dict[str, Any]) -> dict[str, Any]:
                         "target_price": w["target_price"],
                         "below_target": float(w["last_price"]) <= float(w["target_price"]),
                         "retailer": w.get("last_retailer"),
+                        "store_url": w.get("last_store_url"),
                         "total_price_with_shipping": w.get("last_total_price"),
                         "lowest_30d_price": w.get("lowest_30d_price"),
                         "lowest_all_time_price": w.get("lowest_all_time_price"),
@@ -380,6 +391,7 @@ def push_ha_sensors(watches: dict[str, Any]) -> dict[str, Any]:
                         "below_target": float(q["best_match_price"]) <= float(q["target_price"]),
                         "best_match_name": q.get("best_match_name"),
                         "best_match_retailer": q.get("best_match_retailer"),
+                        "best_match_store_url": q.get("best_match_store_url"),
                         "best_match_url": q.get("best_match_url"),
                         "match_count": q.get("match_count", 0),
                         "last_checked_at": q.get("last_checked_at"),

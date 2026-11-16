@@ -125,12 +125,14 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "ALTER TABLE product_watches ADD COLUMN alert_below_30d_pct REAL NOT NULL DEFAULT 0",
         "ALTER TABLE product_watches ADD COLUMN ai_requirements TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE product_watches ADD COLUMN last_ai_verdict_json TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE product_watches ADD COLUMN last_store_url TEXT",
         "ALTER TABLE query_watches ADD COLUMN include_outlet INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE query_watches ADD COLUMN best_match_public_id INTEGER",
         "ALTER TABLE query_watches ADD COLUMN best_match_name TEXT",
         "ALTER TABLE query_watches ADD COLUMN best_match_price REAL",
         "ALTER TABLE query_watches ADD COLUMN best_match_retailer TEXT",
         "ALTER TABLE query_watches ADD COLUMN best_match_url TEXT",
+        "ALTER TABLE query_watches ADD COLUMN best_match_store_url TEXT",
         "ALTER TABLE query_watches ADD COLUMN match_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE query_watches ADD COLUMN top_matches_json TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE query_watches ADD COLUMN ai_requirements TEXT NOT NULL DEFAULT ''",
@@ -192,6 +194,7 @@ def upsert_product_watch(
     last_price: float | None = None,
     last_total_price: float | None = None,
     last_retailer: str | None = None,
+    last_store_url: str | None = None,
     lowest_30d_price: float | None = None,
     lowest_all_time_price: float | None = None,
     notes: str = "",
@@ -215,10 +218,10 @@ def upsert_product_watch(
             INSERT INTO product_watches (
                 public_id, product_uuid, product_name, product_url, target_price,
                 in_stock_only, exclude_refurbished, alert_on_all_time_low, alert_below_30d_pct,
-                ai_requirements, last_price, last_total_price, last_retailer, lowest_seen_price,
-                lowest_30d_price, lowest_all_time_price, last_checked_at, active, notes
+                ai_requirements, last_price, last_total_price, last_retailer, last_store_url,
+                lowest_seen_price, lowest_30d_price, lowest_all_time_price, last_checked_at, active, notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(public_id) DO UPDATE SET
                 product_uuid = COALESCE(excluded.product_uuid, product_watches.product_uuid),
                 product_name = excluded.product_name,
@@ -235,6 +238,7 @@ def upsert_product_watch(
                 last_price = COALESCE(excluded.last_price, product_watches.last_price),
                 last_total_price = COALESCE(excluded.last_total_price, product_watches.last_total_price),
                 last_retailer = COALESCE(excluded.last_retailer, product_watches.last_retailer),
+                last_store_url = COALESCE(excluded.last_store_url, product_watches.last_store_url),
                 lowest_seen_price = COALESCE(excluded.lowest_seen_price, product_watches.lowest_seen_price),
                 lowest_30d_price = COALESCE(excluded.lowest_30d_price, product_watches.lowest_30d_price),
                 lowest_all_time_price = COALESCE(excluded.lowest_all_time_price, product_watches.lowest_all_time_price),
@@ -259,6 +263,7 @@ def upsert_product_watch(
                 last_price,
                 last_total_price,
                 last_retailer,
+                last_store_url,
                 lowest_seen,
                 lowest_30d_price,
                 lowest_all_time_price,
@@ -530,6 +535,7 @@ def update_product_watch_state(
     last_retailer: str | None,
     lowest_30d_price: float | None,
     lowest_all_time_price: float | None,
+    last_store_url: str | None = None,
     last_alerted_price: float | None = None,
 ) -> None:
     """Update cached price metrics and check timestamp for a product watch."""
@@ -559,6 +565,7 @@ def update_product_watch_state(
             SET last_price = COALESCE(?, last_price),
                 last_total_price = COALESCE(?, last_total_price),
                 last_retailer = COALESCE(?, last_retailer),
+                last_store_url = COALESCE(?, last_store_url),
                 lowest_seen_price = ?,
                 lowest_30d_price = COALESCE(?, lowest_30d_price),
                 lowest_all_time_price = COALESCE(?, lowest_all_time_price),
@@ -570,6 +577,7 @@ def update_product_watch_state(
                 last_price,
                 last_total_price,
                 last_retailer,
+                last_store_url,
                 lowest_seen,
                 lowest_30d_price,
                 lowest_all_time_price,
@@ -611,6 +619,7 @@ def update_query_watch_results(
                 best_match_price = ?,
                 best_match_retailer = ?,
                 best_match_url = ?,
+                best_match_store_url = ?,
                 top_matches_json = ?,
                 last_checked_at = ?
             WHERE id = ?
@@ -622,6 +631,7 @@ def update_query_watch_results(
                 best_match.get("lowest_price") if best_match else None,
                 best_match.get("best_retailer") if best_match else None,
                 best_match.get("url") if best_match else None,
+                (best_match.get("best_store_url") or best_match.get("store_url")) if best_match else None,
                 json.dumps(top_matches, ensure_ascii=False),
                 utc_now_iso(),
                 watch_id,

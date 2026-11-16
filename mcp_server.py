@@ -230,6 +230,7 @@ def add_product_watch(
         last_price=current_price,
         last_total_price=details.get("lowest_total_price"),
         last_retailer=details.get("best_retailer"),
+        last_store_url=details.get("best_store_url"),
         lowest_30d_price=details.get("lowest_30d_price"),
         lowest_all_time_price=details.get("lowest_all_time_price"),
         notes=notes,
@@ -254,6 +255,7 @@ def add_product_watch(
         "current_price": current_price,
         "current_total_price": details.get("lowest_total_price"),
         "best_retailer": details.get("best_retailer"),
+        "best_store_url": details.get("best_store_url"),
         "target_price": float(target_price),
         "already_below_target": is_below_target,
         "lowest_30d_price": details.get("lowest_30d_price"),
@@ -327,6 +329,7 @@ def add_interest_watch(
             "lowest_price": m["lowest_price"],
             "lowest_total_price": m.get("lowest_total_price"),
             "best_retailer": m.get("best_retailer"),
+            "store_url": m.get("best_store_url"),
             "url": m["url"],
         }
         for m in filtered[:5]

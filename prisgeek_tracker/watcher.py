@@ -187,6 +187,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     "deal_assessment": details.get("deal_assessment"),
                     "trigger_reason": full_reason,
                     "url": details["url"],
+                    "store_url": details.get("best_store_url"),
                 }
                 notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)
                 log_alert(
@@ -205,6 +206,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                 last_price=current_price,
                 last_total_price=total_price,
                 last_retailer=retailer,
+                last_store_url=details.get("best_store_url"),
                 lowest_30d_price=details.get("lowest_30d_price"),
                 lowest_all_time_price=details.get("lowest_all_time_price"),
                 last_alerted_price=alerted_price,
@@ -246,6 +248,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     "lowest_price": m["lowest_price"],
                     "lowest_total_price": m.get("lowest_total_price"),
                     "best_retailer": m.get("best_retailer"),
+                    "store_url": m.get("best_store_url"),
                     "url": m["url"],
                 }
                 for m in matched_items[:5]
@@ -337,6 +340,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                         "retailer": item.get("best_retailer"),
                         "trigger_reason": f"Intressebevakning under maxpris{ai_suffix}",
                         "url": item["url"],
+                        "store_url": item.get("best_store_url"),
                     }
                     notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)
                     log_alert(

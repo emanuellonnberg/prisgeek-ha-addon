@@ -807,6 +807,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </svg>`;
     }
 
+    function renderStoreLink(retailerName, storeUrl, labelOverride = null) {
+      const text = labelOverride || retailerName || "Till butik";
+      if (!storeUrl) return esc(retailerName || "–");
+      return `<a href="${esc(storeUrl)}" target="_blank" rel="noopener" title="Öppna direkt hos ${esc(retailerName || 'butiken')}">${esc(text)} ↗</a>`;
+    }
+
     function renderReviewLinksHtml(links, sweReviews = [], compact = false) {
       const sweBadges = (sweReviews || []).map(r => {
         const label = `SweClockers: ${r.award_label || r.title}`;
@@ -896,6 +902,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span>30d-lägsta: <strong>${fmtKr(det.lowest_30d_price)}</strong></span>
             <span>Lägsta någonsin: <strong>${fmtKr(det.lowest_all_time_price)}</strong></span>
             <span class="badge badge-muted">${esc(det.deal_assessment)}</span>
+            ${det.best_store_url ? `<a class="badge badge-green" style="text-decoration:none;" href="${esc(det.best_store_url)}" target="_blank" rel="noopener">Köp hos ${esc(det.best_retailer || "butik")} ↗</a>` : ""}
             <a href="${esc(det.url)}" target="_blank" rel="noopener">Öppna på PrisGeek ↗</a>
             <button class="btn-primary btn-sm" type="button" onclick="runAiAnalyzeProduct(${Number(publicId)}, ${targetPrice !== null ? Number(targetPrice) : "null"}, ${watchId !== null ? Number(watchId) : "null"})">Kör AI-analys</button>
           </div>
@@ -909,7 +916,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <tbody>
                 ${offers.map(o => `
                   <tr>
-                    <td>${esc(o.retailer_name)}</td>
+                    <td>${renderStoreLink(o.retailer_name, o.store_url)}</td>
                     <td><strong>${fmtKr(o.price)}</strong></td>
                     <td>${fmtKr(o.shipping)}</td>
                     <td>${fmtKr(o.total_price)}</td>
@@ -960,7 +967,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <tr>
                   <td><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.name)}</a></td>
                   <td><strong>${fmtKr(m.lowest_price)}</strong><div class="subtext">${fmtKr(m.lowest_total_price)} inkl.</div></td>
-                  <td>${esc(m.best_retailer || "–")}</td>
+                  <td>${renderStoreLink(m.best_retailer, m.store_url || m.best_store_url)}</td>
                   <td>${aiCell}</td>
                   <td class="actions-cell">
                     <button class="btn-secondary btn-sm" onclick="openProductDetailModal(${Number(m.public_id)}, ${Number(qw.target_price)})">Graf</button>
@@ -1147,7 +1154,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                       ${w.ai_requirements ? `<div class="subtext">AI: ${esc(w.ai_requirements)}</div>` : ""}
                     </td>
                     <td><strong>${fmtKr(cur)}</strong></td>
-                    <td>${esc(w.last_retailer || "–")}</td>
+                    <td>${renderStoreLink(w.last_retailer, w.last_store_url)}</td>
                     <td>
                       <strong>${fmtKr(target)}</strong>
                       ${rules.length ? `<div class="subtext">${esc(rules.join(" · "))}</div>` : ""}
@@ -1193,7 +1200,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     : `<span class="badge badge-amber">+${Math.round(diff)} kr över</span>`;
                   matchHtml = `
                     <div><a href="${esc(q.best_match_url)}" target="_blank" rel="noopener">${esc(q.best_match_name)}</a></div>
-                    <div class="subtext"><strong>${fmtKr(q.best_match_price)}</strong> @ ${esc(q.best_match_retailer || "–")} · ${diffBadge} <span class="badge badge-muted">${Number(q.match_count || 0)} träffar</span></div>`;
+                    <div class="subtext"><strong>${fmtKr(q.best_match_price)}</strong> @ ${renderStoreLink(q.best_match_retailer, q.best_match_store_url)} · ${diffBadge} <span class="badge badge-muted">${Number(q.match_count || 0)} träffar</span></div>`;
                 } else if (q.last_checked_at) {
                   matchHtml = `<span class="badge badge-red">0 träffar</span>`;
                 }
@@ -1350,7 +1357,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     ${d.forum_url ? `<div class="subtext"><a href="${esc(d.forum_url)}" target="_blank" rel="noopener">Diskussion på SweClockers ↗</a></div>` : ""}
                   </td>
                   <td>${esc(d.category || "–")}</td>
-                  <td>${esc(d.retailer_name)}</td>
+                  <td>${renderStoreLink(d.retailer_name, d.store_url)}</td>
                   <td><strong>${fmtKr(d.price)}</strong></td>
                   <td>${esc(d.tipster || "–")}</td>
                   <td class="actions-cell">
@@ -1391,7 +1398,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <td><strong>${fmtKr(it.price)}</strong></td>
                   <td>${fmtKr(it.new_price)}</td>
                   <td>${it.discount_pct ? `<span class="badge badge-green">-${Number(it.discount_pct).toFixed(1)}%</span>` : "–"}</td>
-                  <td>${esc(it.retailer)}</td>
+                  <td>${renderStoreLink(it.retailer, it.store_url)}</td>
                   <td class="actions-cell">
                     <button class="btn-secondary btn-sm" onclick="openProductDetailModal(${Number(it.public_id)})">Graf</button>
                     <button class="btn-primary btn-sm" onclick="openWatchFromList('fyndvarorItems', ${idx})">Bevaka</button>
@@ -1681,7 +1688,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <td>${esc(item.brand || "–")}</td>
                   <td><strong>${fmtKr(item.lowest_price)}</strong></td>
                   <td>${fmtKr(item.lowest_total_price)}</td>
-                  <td>${esc(item.best_retailer || "–")}</td>
+                  <td>${renderStoreLink(item.best_retailer, item.best_store_url)}</td>
                   <td>${item.in_stock ? `<span class="badge badge-green">I lager</span>` : `<span class="badge badge-red">Slut</span>`}</td>
                   <td class="actions-cell">
                     <button class="btn-secondary btn-sm" onclick="openProductDetailModal(${Number(item.public_id)})">Graf &amp; Butiker</button>

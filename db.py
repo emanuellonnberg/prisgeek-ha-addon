@@ -106,6 +106,12 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_alert_log_lookup
                 ON alert_log (watch_type, watch_id, public_id);
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         _migrate_schema(conn)
@@ -117,6 +123,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     alter_statements = [
         "ALTER TABLE product_watches ADD COLUMN alert_on_all_time_low INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE product_watches ADD COLUMN alert_below_30d_pct REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE product_watches ADD COLUMN ai_requirements TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE product_watches ADD COLUMN last_ai_verdict_json TEXT NOT NULL DEFAULT '{}'",
         "ALTER TABLE query_watches ADD COLUMN include_outlet INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE query_watches ADD COLUMN best_match_public_id INTEGER",
         "ALTER TABLE query_watches ADD COLUMN best_match_name TEXT",
@@ -125,6 +133,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "ALTER TABLE query_watches ADD COLUMN best_match_url TEXT",
         "ALTER TABLE query_watches ADD COLUMN match_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE query_watches ADD COLUMN top_matches_json TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE query_watches ADD COLUMN ai_requirements TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE query_watches ADD COLUMN last_ai_summary_json TEXT NOT NULL DEFAULT '{}'",
     ]
     for stmt in alter_statements:
         try:
@@ -151,6 +161,19 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
                 data["top_matches"] = []
         else:
             data["top_matches"] = []
+    for src_key, dst_key in (
+        ("last_ai_verdict_json", "ai_verdict"),
+        ("last_ai_summary_json", "ai_summary"),
+    ):
+        if src_key in data:
+            raw_val = data.get(src_key)
+            if isinstance(raw_val, str) and raw_val.strip():
+                try:
+                    data[dst_key] = json.loads(raw_val)
+                except json.JSONDecodeError:
+                    data[dst_key] = {}
+            else:
+                data[dst_key] = {}
     return data
 
 
@@ -165,6 +188,7 @@ def upsert_product_watch(
     exclude_refurbished: bool = True,
     alert_on_all_time_low: bool = True,
     alert_below_30d_pct: float = 0.0,
+    ai_requirements: str = "",
     last_price: float | None = None,
     last_total_price: float | None = None,
     last_retailer: str | None = None,
@@ -191,10 +215,10 @@ def upsert_product_watch(
             INSERT INTO product_watches (
                 public_id, product_uuid, product_name, product_url, target_price,
                 in_stock_only, exclude_refurbished, alert_on_all_time_low, alert_below_30d_pct,
-                last_price, last_total_price, last_retailer, lowest_seen_price,
+                ai_requirements, last_price, last_total_price, last_retailer, lowest_seen_price,
                 lowest_30d_price, lowest_all_time_price, last_checked_at, active, notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(public_id) DO UPDATE SET
                 product_uuid = COALESCE(excluded.product_uuid, product_watches.product_uuid),
                 product_name = excluded.product_name,
@@ -204,6 +228,10 @@ def upsert_product_watch(
                 exclude_refurbished = excluded.exclude_refurbished,
                 alert_on_all_time_low = excluded.alert_on_all_time_low,
                 alert_below_30d_pct = excluded.alert_below_30d_pct,
+                ai_requirements = CASE
+                    WHEN excluded.ai_requirements != '' THEN excluded.ai_requirements
+                    ELSE product_watches.ai_requirements
+                END,
                 last_price = COALESCE(excluded.last_price, product_watches.last_price),
                 last_total_price = COALESCE(excluded.last_total_price, product_watches.last_total_price),
                 last_retailer = COALESCE(excluded.last_retailer, product_watches.last_retailer),
@@ -227,6 +255,7 @@ def upsert_product_watch(
                 int(exclude_refurbished),
                 int(alert_on_all_time_low),
                 float(alert_below_30d_pct),
+                ai_requirements.strip(),
                 last_price,
                 last_total_price,
                 last_retailer,
@@ -255,6 +284,7 @@ def add_query_watch(
     in_stock_only: bool = True,
     exclude_refurbished: bool = True,
     include_outlet: bool = False,
+    ai_requirements: str = "",
 ) -> dict[str, Any]:
     """Create a new keyword/interest discovery watch rule and return the saved row."""
     init_db()
@@ -265,9 +295,10 @@ def add_query_watch(
             """
             INSERT INTO query_watches (
                 name, search_query, must_include_keywords, exclude_keywords,
-                target_price, in_stock_only, exclude_refurbished, include_outlet, active
+                target_price, in_stock_only, exclude_refurbished, include_outlet,
+                ai_requirements, active
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 name.strip(),
@@ -278,6 +309,7 @@ def add_query_watch(
                 int(in_stock_only),
                 int(exclude_refurbished),
                 int(include_outlet),
+                ai_requirements.strip(),
             ),
         )
         watch_id = cursor.lastrowid
@@ -298,6 +330,7 @@ def update_product_watch_config(
     exclude_refurbished: bool = True,
     alert_on_all_time_low: bool = True,
     alert_below_30d_pct: float = 0.0,
+    ai_requirements: str = "",
 ) -> dict[str, Any]:
     """Update mutable settings on an existing product watch and return the updated row."""
     init_db()
@@ -310,7 +343,8 @@ def update_product_watch_config(
                 in_stock_only = ?,
                 exclude_refurbished = ?,
                 alert_on_all_time_low = ?,
-                alert_below_30d_pct = ?
+                alert_below_30d_pct = ?,
+                ai_requirements = ?
             WHERE id = ? AND active = 1
             """,
             (
@@ -320,6 +354,7 @@ def update_product_watch_config(
                 int(exclude_refurbished),
                 int(alert_on_all_time_low),
                 float(alert_below_30d_pct),
+                ai_requirements.strip(),
                 watch_id,
             ),
         )
@@ -340,6 +375,7 @@ def update_query_watch_config(
     exclude_keywords: list[str] | None = None,
     in_stock_only: bool = True,
     include_outlet: bool = False,
+    ai_requirements: str = "",
 ) -> dict[str, Any]:
     """Update mutable settings on an existing interest/query watch and return the updated row."""
     init_db()
@@ -356,7 +392,8 @@ def update_query_watch_config(
                 target_price = ?,
                 in_stock_only = ?,
                 include_outlet = ?,
-                exclude_refurbished = ?
+                exclude_refurbished = ?,
+                ai_requirements = ?
             WHERE id = ? AND active = 1
             """,
             (
@@ -368,6 +405,7 @@ def update_query_watch_config(
                 int(in_stock_only),
                 int(include_outlet),
                 int(not include_outlet),
+                ai_requirements.strip(),
                 watch_id,
             ),
         )
@@ -658,3 +696,60 @@ def get_recent_history(public_id: int | None = None, limit: int = 20) -> list[di
                 (limit,),
             ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def save_product_ai_verdict(watch_id: int, verdict: dict[str, Any]) -> None:
+    """Persist the latest AI deal verdict JSON for a product watch."""
+    init_db()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE product_watches SET last_ai_verdict_json = ? WHERE id = ?",
+            (json.dumps(verdict, ensure_ascii=False), watch_id),
+        )
+        conn.commit()
+
+
+def save_query_ai_summary(watch_id: int, summary: dict[str, Any]) -> None:
+    """Persist the latest AI vetting summary JSON for a query/interest watch."""
+    init_db()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE query_watches SET last_ai_summary_json = ? WHERE id = ?",
+            (json.dumps(summary, ensure_ascii=False), watch_id),
+        )
+        conn.commit()
+
+
+def get_setting(key: str, default: Any = None) -> Any:
+    """Read a JSON-decoded setting from app_settings, returning default if absent."""
+    init_db()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+    if row is None:
+        return default
+    raw = row["value"]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def set_setting(key: str, value: Any) -> None:
+    """Upsert a setting value (JSON-encoded) in app_settings."""
+    init_db()
+    encoded = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, encoded, utc_now_iso()),
+        )
+        conn.commit()

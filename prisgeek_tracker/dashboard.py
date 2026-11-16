@@ -13,8 +13,16 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
+from ai_advisor import (
+    DEFAULT_AI_PROFILE,
+    analyze_product_deal,
+    find_cross_tier_alternatives,
+    generate_ai_deal_digest,
+    vet_interest_watch_matches,
+)
 from db import (
     get_recent_history,
+    get_setting,
     init_db,
     list_all_watches,
     remove_watch,
@@ -334,6 +342,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button class="tab-btn" data-tab="medlemsfynd">Medlemsfynd</button>
       <button class="tab-btn" data-tab="fyndvaror">Fyndvaror / Outlet</button>
       <button class="tab-btn" data-tab="basket">Inköpslista &amp; HA</button>
+      <button class="tab-btn" data-tab="ai">AI-Rådgivare &amp; Digest</button>
     </nav>
 
     <section id="tab-watches" class="tab-panel active">
@@ -353,6 +362,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <label for="pw-pct30">Smart Deal (% under 30d-lägsta)</label>
               <input id="pw-pct30" type="number" step="1" min="0" max="90" value="0" />
             </div>
+          </div>
+          <div class="form-row">
+            <label for="pw-ai-req">AI-kravspec (valfritt)</label>
+            <input id="pw-ai-req" placeholder="t.ex. Tyst kylare, minst 10 års garanti" />
           </div>
           <div class="form-row">
             <label for="pw-notes">Anteckning (valfritt)</label>
@@ -391,6 +404,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <label for="iw-exclude">Exkludera (komma)</label>
               <input id="iw-exclude" placeholder="t.ex. demo, A1" />
             </div>
+          </div>
+          <div class="form-row">
+            <label for="iw-ai-req">AI-kravspec (valfritt)</label>
+            <input id="iw-ai-req" placeholder="t.ex. Endast A2/V30 med bra kylning, inga budgetfällor" />
           </div>
           <div class="form-row">
             <label class="checkbox-label">
@@ -534,6 +551,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="table-wrap" id="history-container"></div>
       </div>
     </section>
+
+    <section id="tab-ai" class="tab-panel">
+      <div class="card">
+        <h2>Min AI-intresseprofil &amp; Black Week Digest</h2>
+        <div class="form-row">
+          <label for="ai-profile-input">Beskriv vad du är intresserad av (sparas automatiskt)</label>
+          <textarea id="ai-profile-input" rows="3" placeholder="t.ex. RTX 5060 Ti/5070, snabb microSD A2/V30 till Jetson, 3D-skrivare/filament, Zigbee/Matter..."></textarea>
+        </div>
+        <div class="form-inline" style="margin-bottom: 12px;">
+          <label class="checkbox-label">
+            <input type="checkbox" id="ai-digest-notify" /> Skicka sammanfattning till iPhone
+          </label>
+          <button class="btn-primary" id="ai-digest-btn" type="button">Generera Topp 5 AI-fynd</button>
+        </div>
+        <div id="ai-digest-container">
+          <div class="empty-msg">Klicka "Generera Topp 5 AI-fynd" för att låta Home Assistant AI välja dagens bästa teknikfynd.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="deal-meta" style="margin-bottom: 10px;">
+          <h2 style="margin: 0;">Kors-alternativ &amp; Uppgraderingar (nära dina bevakningar)</h2>
+          <button class="btn-secondary btn-sm" id="ai-alt-btn" type="button">Sök bättre alternativ</button>
+        </div>
+        <div id="ai-alt-container">
+          <div class="empty-msg">Klicka "Sök bättre alternativ" för att skanna prisfall och medlemsfynd efter högre-tier-uppgraderingar i liknande prisklass.</div>
+        </div>
+      </div>
+    </section>
   </div>
 
   <dialog class="modal" id="watch-modal">
@@ -563,6 +609,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <label for="ep-pct30">% under 30d-lägsta</label>
           <input id="ep-pct30" type="number" step="1" min="0" max="90" required />
         </div>
+      </div>
+      <div class="form-row">
+        <label for="ep-ai-req">AI-kravspec (valfritt)</label>
+        <input id="ep-ai-req" placeholder="t.ex. Minst A2/V30 eller tyst 3-fläktkylare" />
       </div>
       <div class="form-row">
         <label for="ep-notes">Anteckning</label>
@@ -603,6 +653,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="form-row">
         <label for="ei-excl">Exkluderade nyckelord (komma)</label>
         <input id="ei-excl" />
+      </div>
+      <div class="form-row">
+        <label for="ei-ai-req">AI-kravspec (valfritt)</label>
+        <input id="ei-ai-req" placeholder="t.ex. Endast A2/V30, undvik budgetmodeller" />
       </div>
       <div class="form-row">
         <label class="checkbox-label"><input type="checkbox" id="ei-stock" /> Endast i lager</label>
@@ -725,7 +779,56 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </svg>`;
     }
 
-    async function openProductDetailModal(publicId, targetPrice = null) {
+    function renderAiVerdictHtml(v) {
+      if (!v || !v.verdict_badge) return "";
+      const score = Number(v.score || 0);
+      const cls = score >= 8 ? "badge-green" : score >= 5 ? "badge-amber" : "badge-red";
+      return `
+        <div style="padding:12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); margin-bottom:14px;">
+          <div class="deal-meta" style="margin-bottom:6px;">
+            <span class="badge ${cls}">AI-Betyg: ${score}/10 · ${esc(v.verdict_badge)}</span>
+            <span class="subtext">${v.analyzed_at ? fmtDate(v.analyzed_at) : ""}</span>
+          </div>
+          <div style="font-size:0.88rem; margin-bottom:4px;"><strong>Pris &amp; Köpråd:</strong> ${esc(v.buy_or_wait)}</div>
+          <div style="font-size:0.88rem;"><strong>Spec &amp; Krav:</strong> ${esc(v.spec_check)}</div>
+        </div>`;
+    }
+
+    async function runAiAnalyzeProduct(publicId, targetPrice = null, watchId = null) {
+      const box = document.getElementById("detail-ai-box");
+      if (!box) return;
+      const w = watchId ? (state.watches?.product_watches || []).find(x => Number(x.id) === Number(watchId)) : null;
+      box.innerHTML = `<div class="empty-msg">Kör AI-analys via Home Assistant (kan ta några sekunder)...</div>`;
+      try {
+        const res = await apiFetch("/api/ai/analyze-product", {
+          method: "POST",
+          body: JSON.stringify({
+            public_id: Number(publicId),
+            target_price: targetPrice,
+            ai_requirements: w?.ai_requirements || "",
+            watch_id: watchId,
+          }),
+        });
+        box.innerHTML = renderAiVerdictHtml(res);
+        if (watchId) await loadState();
+      } catch (err) {
+        box.innerHTML = `<div class="empty-msg">AI-analys misslyckades: ${esc(err.message)}</div>`;
+      }
+    }
+
+    async function vetInterestWatch(watchId) {
+      showToast("Kör AI-kravgranskning av matchningar...");
+      try {
+        const res = await apiFetch(`/api/ai/vet-interest/${Number(watchId)}`, { method: "POST", body: "{}" });
+        showToast(res.overall_advice || "AI-granskning klar!");
+        await loadState();
+        openTopMatchesModal(watchId);
+      } catch (err) {
+        showToast(`AI-granskning misslyckades: ${err.message}`, true);
+      }
+    }
+
+    async function openProductDetailModal(publicId, targetPrice = null, watchId = null, autoAi = false) {
       const modal = document.getElementById("detail-modal");
       const body = document.getElementById("detail-body");
       document.getElementById("detail-title").textContent = "Hämtar historik & butiker...";
@@ -736,14 +839,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById("detail-title").textContent = det.name;
         const chartSvg = renderHistoryChart(det.history_series || [], targetPrice);
         const offers = det.offers || [];
+        const reviews = det.extra_context?.reviews || [];
+        const w = watchId ? (state.watches?.product_watches || []).find(x => Number(x.id) === Number(watchId)) : null;
+        const cachedVerdict = w?.ai_verdict?.verdict_badge ? renderAiVerdictHtml(w.ai_verdict) : "";
+
         body.innerHTML = `
-          <div style="display:flex; gap:14px; flex-wrap:wrap; margin-bottom:12px; font-size:0.86rem;">
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; font-size:0.86rem;">
             <span>Nuvarande: <strong>${fmtKr(det.lowest_price)}</strong></span>
             <span>30d-lägsta: <strong>${fmtKr(det.lowest_30d_price)}</strong></span>
             <span>Lägsta någonsin: <strong>${fmtKr(det.lowest_all_time_price)}</strong></span>
             <span class="badge badge-muted">${esc(det.deal_assessment)}</span>
             <a href="${esc(det.url)}" target="_blank" rel="noopener">Öppna på PrisGeek ↗</a>
+            <button class="btn-primary btn-sm" type="button" onclick="runAiAnalyzeProduct(${Number(publicId)}, ${targetPrice !== null ? Number(targetPrice) : "null"}, ${watchId !== null ? Number(watchId) : "null"})">Kör AI-analys</button>
           </div>
+          ${reviews.length ? `<div style="margin-bottom:10px;">${reviews.map(r => `<span class="badge badge-purple" style="margin-right:6px;">SweClockers: ${esc(r.award_label || r.title)}</span>`).join("")}</div>` : ""}
+          <div id="detail-ai-box">${cachedVerdict}</div>
           <div style="margin-bottom:14px;">${chartSvg}</div>
           <h4 style="margin:10px 0 6px;">Butikserbjudanden (${offers.length})</h4>
           <div class="table-wrap">
@@ -761,6 +871,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               </tbody>
             </table>
           </div>`;
+        if (autoAi) {
+          runAiAnalyzeProduct(publicId, targetPrice, watchId);
+        }
       } catch (err) {
         body.innerHTML = `<div class="empty-msg">Fel: ${esc(err.message)}</div>`;
       }
@@ -771,26 +884,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!qw) return;
       document.getElementById("tm-title").textContent = `Topp 5 matchningar: ${qw.name}`;
       const matches = qw.top_matches || [];
+      const aiSummary = qw.ai_summary || {};
+      const vettedMap = {};
+      for (const v of (aiSummary.vetted || [])) {
+        vettedMap[Number(v.public_id)] = v;
+      }
       state.topMatches = matches;
       const body = document.getElementById("tm-body");
       if (!matches.length) {
         body.innerHTML = `<div class="empty-msg">Inga matchningar loggade ännu. Klicka "Kör priskontroll nu".</div>`;
       } else {
-        body.innerHTML = `
+        const adviceHtml = aiSummary.overall_advice
+          ? `<div style="margin-bottom:12px; padding:10px; border-radius:8px; background:var(--surface-2); font-size:0.86rem;"><strong>AI-råd:</strong> ${esc(aiSummary.overall_advice)}</div>`
+          : "";
+        body.innerHTML = `${adviceHtml}
           <table>
-            <thead><tr><th>Produkt</th><th>Pris</th><th>Inkl. frakt</th><th>Butik</th><th></th></tr></thead>
+            <thead><tr><th>Produkt</th><th>Pris</th><th>Butik</th><th>AI-bedömning</th><th></th></tr></thead>
             <tbody>
-              ${matches.map((m, idx) => `
+              ${matches.map((m, idx) => {
+                const v = vettedMap[Number(m.public_id)];
+                const aiScore = m.ai_score ?? v?.score;
+                const aiApproved = m.ai_approved ?? v?.approved;
+                const aiNote = m.ai_note ?? v?.note;
+                const aiCell = aiScore !== undefined
+                  ? `<span class="badge ${aiApproved === false ? "badge-red" : "badge-green"}">${Number(aiScore)}/10</span><div class="subtext">${esc(aiNote || "")}</div>`
+                  : `<span class="subtext">–</span>`;
+                return `
                 <tr>
                   <td><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.name)}</a></td>
-                  <td><strong>${fmtKr(m.lowest_price)}</strong></td>
-                  <td>${fmtKr(m.lowest_total_price)}</td>
+                  <td><strong>${fmtKr(m.lowest_price)}</strong><div class="subtext">${fmtKr(m.lowest_total_price)} inkl.</div></td>
                   <td>${esc(m.best_retailer || "–")}</td>
+                  <td>${aiCell}</td>
                   <td class="actions-cell">
                     <button class="btn-secondary btn-sm" onclick="openProductDetailModal(${Number(m.public_id)}, ${Number(qw.target_price)})">Graf</button>
                     <button class="btn-primary btn-sm" onclick="openWatchFromList('topMatches', ${idx})">Bevaka</button>
                   </td>
-                </tr>`).join("")}
+                </tr>`;
+              }).join("")}
             </tbody>
           </table>`;
       }
@@ -804,6 +934,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("ep-title").textContent = `Redigera: ${w.product_name}`;
       document.getElementById("ep-target").value = String(w.target_price);
       document.getElementById("ep-pct30").value = String(w.alert_below_30d_pct || 0);
+      document.getElementById("ep-ai-req").value = w.ai_requirements || "";
       document.getElementById("ep-notes").value = w.notes || "";
       document.getElementById("ep-stock").checked = Boolean(w.in_stock_only);
       document.getElementById("ep-alltime").checked = w.alert_on_all_time_low !== 0;
@@ -819,9 +950,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("ei-target").value = String(q.target_price);
       document.getElementById("ei-must").value = (q.must_include_keywords || []).join(", ");
       document.getElementById("ei-excl").value = (q.exclude_keywords || []).join(", ");
+      document.getElementById("ei-ai-req").value = q.ai_requirements || "";
       document.getElementById("ei-stock").checked = Boolean(q.in_stock_only);
       document.getElementById("ei-outlet").checked = Boolean(q.include_outlet);
       document.getElementById("edit-interest-modal").showModal();
+    }
+
+    function renderAiDigest(digest) {
+      const container = document.getElementById("ai-digest-container");
+      if (!digest || !digest.picks || !digest.picks.length) return;
+      state.aiPicks = digest.picks;
+      container.innerHTML = `
+        <div style="margin-bottom:12px; font-size:0.92rem;"><strong>${esc(digest.headline)}</strong> <span class="subtext">(${fmtDate(digest.generated_at)})</span></div>
+        <div class="deals-grid">
+          ${digest.picks.map((p, idx) => `
+            <div class="deal-card">
+              <div>
+                <div class="deal-meta">
+                  <span class="badge badge-green">AI ${Number(p.score || 8)}/10</span>
+                  <span class="badge badge-purple">${esc(p.discount_info || "Fynd")}</span>
+                </div>
+                <div style="margin-top:8px; font-weight:600;">
+                  <a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a>
+                </div>
+                <div class="subtext">${esc(p.retailer || "")}</div>
+                <div style="font-size:0.84rem; margin-top:6px;">${esc(p.reason || "")}</div>
+              </div>
+              <div class="deal-meta">
+                <span class="deal-price">${fmtKr(p.price)}</span>
+                ${p.public_id ? `<button class="btn-primary btn-sm" onclick="openWatchFromList('aiPicks', ${idx})">Bevaka</button>` : ""}
+              </div>
+            </div>`).join("")}
+        </div>`;
+    }
+
+    function renderAiAlternatives(alts) {
+      const container = document.getElementById("ai-alt-container");
+      if (!alts) return;
+      const items = alts.alternatives || [];
+      state.aiAlternatives = items;
+      if (!items.length) {
+        container.innerHTML = `<div class="empty-msg">${esc(alts.summary || "Inga bättre kors-alternativ hittades just nu.")}</div>`;
+        return;
+      }
+      container.innerHTML = `
+        <div style="margin-bottom:10px; font-size:0.88rem;">${esc(alts.summary || "")}</div>
+        <table>
+          <thead><tr><th>Alternativ</th><th>Pris</th><th>Butik</th><th>Ersätter / För</th><th>Motivering</th><th></th></tr></thead>
+          <tbody>
+            ${items.map((a, idx) => `
+              <tr>
+                <td><a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.title)}</a></td>
+                <td><strong>${fmtKr(a.price)}</strong></td>
+                <td>${esc(a.retailer || "–")}</td>
+                <td>${esc(a.for_watch || "–")}</td>
+                <td style="font-size:0.84rem;">${esc(a.reason || "")}</td>
+                <td>${a.public_id ? `<button class="btn-primary btn-sm" onclick="openWatchFromList('aiAlternatives', ${idx})">Bevaka</button>` : ""}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>`;
     }
 
     function buildLovelaceYaml(pw, qw) {
@@ -863,6 +1050,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("webhook-badge").textContent = `Notis: ${notifySvc} | ${hookStatus}`;
       document.getElementById("ha-yaml-box").textContent = buildLovelaceYaml(pw, qw);
 
+      const profileEl = document.getElementById("ai-profile-input");
+      if (profileEl && !profileEl.value && state.aiProfile) {
+        profileEl.value = state.aiProfile;
+      }
+      if (state.lastDigest) renderAiDigest(state.lastDigest);
+      if (state.lastAlternatives) renderAiAlternatives(state.lastAlternatives);
+
       const pwContainer = document.getElementById("product-watches-container");
       if (!pw.length) {
         pwContainer.innerHTML = `<div class="empty-msg">Inga aktiva produktbevakningar ännu.</div>`;
@@ -895,11 +1089,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const rules = [];
                 if (w.alert_on_all_time_low !== 0) rules.push("All-time");
                 if (Number(w.alert_below_30d_pct) > 0) rules.push(`-${Number(w.alert_below_30d_pct)}% vs 30d`);
+                const aiBadge = w.ai_verdict?.verdict_badge
+                  ? `<div class="subtext"><span class="badge badge-purple">${Number(w.ai_verdict.score || 0)}/10 ${esc(w.ai_verdict.verdict_badge)}</span></div>`
+                  : "";
                 return `
                   <tr>
                     <td>
                       <a href="${esc(w.product_url)}" target="_blank" rel="noopener">${esc(w.product_name)}</a>
                       ${w.notes ? `<div class="subtext">${esc(w.notes)}</div>` : ""}
+                      ${w.ai_requirements ? `<div class="subtext">AI: ${esc(w.ai_requirements)}</div>` : ""}
                     </td>
                     <td><strong>${fmtKr(cur)}</strong></td>
                     <td>${esc(w.last_retailer || "–")}</td>
@@ -908,10 +1106,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                       ${rules.length ? `<div class="subtext">${esc(rules.join(" · "))}</div>` : ""}
                     </td>
                     <td>${fmtKr(w.lowest_30d_price)} / ${fmtKr(w.lowest_all_time_price)}</td>
-                    <td>${badge}</td>
+                    <td>${badge}${aiBadge}</td>
                     <td>${fmtDate(w.last_checked_at)}</td>
                     <td class="actions-cell">
-                      <button class="btn-secondary btn-sm" onclick="openProductDetailModal(${Number(w.public_id)}, ${Number(w.target_price)})">Graf &amp; Butiker</button>
+                      <button class="btn-secondary btn-sm" onclick="openProductDetailModal(${Number(w.public_id)}, ${Number(w.target_price)}, ${Number(w.id)}, false)">Graf &amp; Butiker</button>
+                      <button class="btn-secondary btn-sm" onclick="openProductDetailModal(${Number(w.public_id)}, ${Number(w.target_price)}, ${Number(w.id)}, true)">AI-analys</button>
                       <button class="btn-secondary btn-sm" onclick="openEditProductModal(${Number(w.id)})">Redigera</button>
                       <button class="btn-danger" onclick="deleteWatch('product', ${Number(w.id)})">Ta bort</button>
                     </td>
@@ -956,6 +1155,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <td>
                       <strong>${esc(q.name)}</strong>
                       <div class="subtext">Sök: ${esc(q.search_query)}${q.include_outlet ? " · Inkl. outlet" : ""}</div>
+                      ${q.ai_requirements ? `<div class="subtext">AI: ${esc(q.ai_requirements)}</div>` : ""}
                     </td>
                     <td>
                       <div>+${esc((q.must_include_keywords || []).join(", ") || "–")}</div>
@@ -966,6 +1166,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <td>${fmtDate(q.last_checked_at)}</td>
                     <td class="actions-cell">
                       <button class="btn-secondary btn-sm" onclick="openTopMatchesModal(${Number(q.id)})">Topp 5</button>
+                      <button class="btn-secondary btn-sm" onclick="vetInterestWatch(${Number(q.id)})">AI-granska</button>
                       <button class="btn-secondary btn-sm" onclick="openEditInterestModal(${Number(q.id)})">Redigera</button>
                       <button class="btn-danger" onclick="deleteWatch('query', ${Number(q.id)})">Ta bort</button>
                     </td>
@@ -992,6 +1193,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state.watches = data.watches;
         state.history = data.history;
         state.config = data.config;
+        state.aiProfile = data.ai_profile;
+        state.lastDigest = data.last_digest;
+        state.lastAlternatives = data.last_alternatives;
         renderState();
       } catch (err) {
         showToast(`Kunde inte ladda status: ${err.message}`, true);
@@ -1269,6 +1473,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             target_price: Number(document.getElementById("pw-target").value),
             alert_below_30d_pct: Number(document.getElementById("pw-pct30").value || 0),
             alert_on_all_time_low: document.getElementById("pw-alltime").checked,
+            ai_requirements: document.getElementById("pw-ai-req").value.trim(),
             in_stock_only: true,
             notes: document.getElementById("pw-notes").value.trim(),
           }),
@@ -1296,6 +1501,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             target_price: Number(document.getElementById("iw-target").value),
             must_include_keywords: keywords,
             exclude_keywords: excludeKeywords,
+            ai_requirements: document.getElementById("iw-ai-req").value.trim(),
             in_stock_only: true,
             include_outlet: document.getElementById("iw-outlet").checked,
           }),
@@ -1317,6 +1523,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           body: JSON.stringify({
             target_price: Number(document.getElementById("ep-target").value),
             alert_below_30d_pct: Number(document.getElementById("ep-pct30").value || 0),
+            ai_requirements: document.getElementById("ep-ai-req").value.trim(),
             notes: document.getElementById("ep-notes").value.trim(),
             in_stock_only: document.getElementById("ep-stock").checked,
             alert_on_all_time_low: document.getElementById("ep-alltime").checked,
@@ -1342,6 +1549,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             target_price: Number(document.getElementById("ei-target").value),
             must_include_keywords: document.getElementById("ei-must").value.split(",").map(s => s.trim()).filter(Boolean),
             exclude_keywords: document.getElementById("ei-excl").value.split(",").map(s => s.trim()).filter(Boolean),
+            ai_requirements: document.getElementById("ei-ai-req").value.trim(),
             in_stock_only: document.getElementById("ei-stock").checked,
             include_outlet: document.getElementById("ei-outlet").checked,
           }),
@@ -1351,6 +1559,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         await loadState();
       } catch (err) {
         showToast(`Fel: ${err.message}`, true);
+      }
+    });
+
+    document.getElementById("ai-digest-btn").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "Analyserar dagens fynd...";
+      try {
+        const res = await apiFetch("/api/ai/digest", {
+          method: "POST",
+          body: JSON.stringify({
+            profile: document.getElementById("ai-profile-input").value.trim(),
+            send_notification: document.getElementById("ai-digest-notify").checked,
+          }),
+        });
+        state.lastDigest = res;
+        renderAiDigest(res);
+        showToast("Topp 5 AI-fynd genererade!");
+      } catch (err) {
+        showToast(`AI-digest misslyckades: ${err.message}`, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Generera Topp 5 AI-fynd";
+      }
+    });
+
+    document.getElementById("ai-alt-btn").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "Söker alternativ...";
+      try {
+        const res = await apiFetch("/api/ai/alternatives", { method: "POST", body: "{}" });
+        state.lastAlternatives = res;
+        renderAiAlternatives(res);
+        showToast("Alternativsökning klar!");
+      } catch (err) {
+        showToast(`Alternativsökning misslyckades: ${err.message}`, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Sök bättre alternativ";
       }
     });
 
@@ -1447,11 +1695,23 @@ async def homepage(_request: Request) -> HTMLResponse:
 
 
 async def api_state(_request: Request) -> JSONResponse:
-    """Return active watches, recent price history, and notifier config."""
+    """Return active watches, recent price history, AI settings/caches, and notifier config."""
     watches = await run_in_threadpool(list_all_watches, True)
     history = await run_in_threadpool(get_recent_history, None, 50)
     config = await run_in_threadpool(load_notifier_config)
-    return JSONResponse({"watches": watches, "history": history, "config": config})
+    ai_profile = await run_in_threadpool(get_setting, "ai_profile", DEFAULT_AI_PROFILE)
+    last_digest = await run_in_threadpool(get_setting, "last_digest", None)
+    last_alternatives = await run_in_threadpool(get_setting, "last_alternatives", None)
+    return JSONResponse(
+        {
+            "watches": watches,
+            "history": history,
+            "config": config,
+            "ai_profile": ai_profile,
+            "last_digest": last_digest,
+            "last_alternatives": last_alternatives,
+        }
+    )
 
 
 async def api_add_product_watch(request: Request) -> JSONResponse:
@@ -1475,6 +1735,7 @@ async def api_add_product_watch(request: Request) -> JSONResponse:
             exclude_refurbished=_parse_bool(body.get("exclude_refurbished"), True),
             alert_on_all_time_low=_parse_bool(body.get("alert_on_all_time_low"), True),
             alert_below_30d_pct=pct30,
+            ai_requirements=str(body.get("ai_requirements") or ""),
             notes=str(body.get("notes") or ""),
         )
         return JSONResponse(result)
@@ -1509,6 +1770,7 @@ async def api_add_interest_watch(request: Request) -> JSONResponse:
             exclude_keywords=list(excl_kw),
             in_stock_only=_parse_bool(body.get("in_stock_only"), True),
             include_outlet=_parse_bool(body.get("include_outlet"), False),
+            ai_requirements=str(body.get("ai_requirements") or ""),
         )
         return JSONResponse(result)
     except Exception as exc:
@@ -1532,6 +1794,7 @@ async def api_update_watch(request: Request) -> JSONResponse:
                 exclude_refurbished=_parse_bool(body.get("exclude_refurbished"), True),
                 alert_on_all_time_low=_parse_bool(body.get("alert_on_all_time_low"), True),
                 alert_below_30d_pct=float(body.get("alert_below_30d_pct") or 0.0),
+                ai_requirements=str(body.get("ai_requirements") or ""),
             )
             return JSONResponse({"watch": updated})
         if watch_type == "query":
@@ -1545,6 +1808,7 @@ async def api_update_watch(request: Request) -> JSONResponse:
                 exclude_keywords=list(body.get("exclude_keywords") or []),
                 in_stock_only=_parse_bool(body.get("in_stock_only"), True),
                 include_outlet=_parse_bool(body.get("include_outlet"), False),
+                ai_requirements=str(body.get("ai_requirements") or ""),
             )
             return JSONResponse({"watch": updated})
         return JSONResponse({"error": "watch_type must be 'product' or 'query'"}, status_code=400)
@@ -1719,6 +1983,91 @@ async def api_basket(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+async def api_ai_analyze_product(request: Request) -> JSONResponse:
+    """Run AI product deal evaluation via Home Assistant AI Task."""
+    try:
+        body = await request.json()
+        public_id = body.get("public_id")
+        if not public_id:
+            return JSONResponse({"error": "public_id is required"}, status_code=400)
+        target_raw = body.get("target_price")
+        target_price = float(target_raw) if target_raw is not None else None
+        ai_req = str(body.get("ai_requirements") or "")
+        watch_id_raw = body.get("watch_id")
+        watch_id = int(watch_id_raw) if watch_id_raw is not None else None
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"error": f"Invalid payload: {exc}"}, status_code=400)
+
+    try:
+        res = await run_in_threadpool(
+            analyze_product_deal,
+            str(public_id),
+            target_price=target_price,
+            ai_requirements=ai_req,
+            watch_id=watch_id,
+        )
+        return JSONResponse(res)
+    except Exception as exc:
+        logger.exception("AI product analysis failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def api_ai_vet_interest(request: Request) -> JSONResponse:
+    """Run AI vetting across top matches for an active interest watch."""
+    watch_id = int(request.path_params["watch_id"])
+    watches = await run_in_threadpool(list_all_watches, True)
+    qw = next((q for q in watches["query_watches"] if int(q["id"]) == watch_id), None)
+    if not qw:
+        return JSONResponse({"error": f"Interest watch #{watch_id} not found"}, status_code=404)
+
+    candidates = qw.get("top_matches") or []
+    if not candidates:
+        candidates = await run_in_threadpool(
+            search_products,
+            qw["search_query"],
+            None,
+            bool(qw["in_stock_only"]),
+            not bool(qw.get("include_outlet", 0)),
+            10,
+        )
+    try:
+        res = await run_in_threadpool(vet_interest_watch_matches, qw, candidates)
+        return JSONResponse(res)
+    except Exception as exc:
+        logger.exception("AI interest vetting failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def api_ai_digest(request: Request) -> JSONResponse:
+    """Generate a curated Top 5 daily AI deal digest."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    profile = body.get("profile")
+    send_notif = _parse_bool(body.get("send_notification"), False)
+    try:
+        res = await run_in_threadpool(
+            generate_ai_deal_digest,
+            custom_profile=profile,
+            send_notification=send_notif,
+        )
+        return JSONResponse(res)
+    except Exception as exc:
+        logger.exception("AI digest failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def api_ai_alternatives(_request: Request) -> JSONResponse:
+    """Find cross-tier upgrade alternatives for active watches."""
+    try:
+        res = await run_in_threadpool(find_cross_tier_alternatives)
+        return JSONResponse(res)
+    except Exception as exc:
+        logger.exception("AI alternatives lookup failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 init_db()
 
 app = Starlette(
@@ -1737,6 +2086,10 @@ app = Starlette(
         Route("/api/medlemsfynd", api_medlemsfynd, methods=["GET"]),
         Route("/api/fyndvaror", api_fyndvaror, methods=["GET"]),
         Route("/api/basket", api_basket, methods=["GET"]),
+        Route("/api/ai/analyze-product", api_ai_analyze_product, methods=["POST"]),
+        Route("/api/ai/vet-interest/{watch_id:int}", api_ai_vet_interest, methods=["POST"]),
+        Route("/api/ai/digest", api_ai_digest, methods=["POST"]),
+        Route("/api/ai/alternatives", api_ai_alternatives, methods=["POST"]),
     ]
 )
 

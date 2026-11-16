@@ -558,6 +558,7 @@ class PrisGeekClient:
 
         cat_obj = row.get("categories")
         category_name = cat_obj.get("name") if isinstance(cat_obj, dict) else None
+        extra_context = self.get_product_extra_context(row.get("id"), pid)
 
         return {
             "public_id": pid,
@@ -581,7 +582,49 @@ class PrisGeekClient:
             "deal_assessment": deal_assessment,
             "specs": row.get("specs"),
             "offers": summary["offers"],
+            "extra_context": extra_context,
         }
+
+    def get_product_extra_context(
+        self, product_uuid: str | None, public_id: int | None = None
+    ) -> dict[str, Any]:
+        """Fetch SweClockers review awards and community member deal tips for a product."""
+        context: dict[str, Any] = {"reviews": [], "member_deals": []}
+        if not product_uuid:
+            return context
+
+        try:
+            rev_rows = self._supabase_get(
+                "product_reviews",
+                [
+                    ("select", "reviews(id,title,url,category,published_at,award_class,award_label)"),
+                    ("product_id", f"eq.{product_uuid}"),
+                    ("status", "eq.approved"),
+                    ("limit", "5"),
+                ],
+            )
+            for r in rev_rows or []:
+                rev = r.get("reviews")
+                if isinstance(rev, dict) and rev.get("title"):
+                    context["reviews"].append(rev)
+        except Exception as exc:
+            logger.debug("product_reviews lookup skipped for %s: %s", product_uuid, exc)
+
+        try:
+            deal_rows = self._supabase_get(
+                "member_deals",
+                [
+                    ("select", "id,title,price,retailer_name,score,tipster,note,forum_url,posted_at"),
+                    ("product_id", f"eq.{product_uuid}"),
+                    ("order", "posted_at.desc.nullslast"),
+                    ("limit", "5"),
+                ],
+            )
+            context["member_deals"] = list(deal_rows or [])
+        except Exception as exc:
+            logger.debug("member_deals lookup skipped for %s: %s", product_uuid, exc)
+
+        return context
 
     def get_prisfall(
         self,

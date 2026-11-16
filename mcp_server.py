@@ -47,10 +47,11 @@ def _remote_request(
     path: str,
     json_body: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    timeout: float = 30.0,
 ) -> Any:
     """Forward an operation to the remote PrisGeek Home Assistant add-on API."""
     base = _remote_url()
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=timeout) as client:
         resp = client.request(method, f"{base}{path}", json=json_body, params=params)
         resp.raise_for_status()
         return resp.json()
@@ -183,6 +184,7 @@ def add_product_watch(
     exclude_refurbished: bool = True,
     alert_on_all_time_low: bool = True,
     alert_below_30d_pct: float = 0.0,
+    ai_requirements: str = "",
     notes: str = "",
 ) -> dict[str, Any]:
     """Add or update a target-price & Smart Deal watch for a specific PrisGeek product ID or URL."""
@@ -197,6 +199,7 @@ def add_product_watch(
                 "exclude_refurbished": exclude_refurbished,
                 "alert_on_all_time_low": alert_on_all_time_low,
                 "alert_below_30d_pct": alert_below_30d_pct,
+                "ai_requirements": ai_requirements,
                 "notes": notes,
             },
         )
@@ -223,6 +226,7 @@ def add_product_watch(
         exclude_refurbished=exclude_refurbished,
         alert_on_all_time_low=alert_on_all_time_low,
         alert_below_30d_pct=alert_below_30d_pct,
+        ai_requirements=ai_requirements,
         last_price=current_price,
         last_total_price=details.get("lowest_total_price"),
         last_retailer=details.get("best_retailer"),
@@ -267,6 +271,7 @@ def add_interest_watch(
     exclude_keywords: list[str] | None = None,
     in_stock_only: bool = True,
     include_outlet: bool = False,
+    ai_requirements: str = "",
 ) -> dict[str, Any]:
     """Create a keyword/interest discovery watch and immediately populate best & top-5 matching products."""
     if _remote_url():
@@ -281,6 +286,7 @@ def add_interest_watch(
                 "exclude_keywords": exclude_keywords or [],
                 "in_stock_only": in_stock_only,
                 "include_outlet": include_outlet,
+                "ai_requirements": ai_requirements,
             },
         )
 
@@ -293,6 +299,7 @@ def add_interest_watch(
         in_stock_only=in_stock_only,
         exclude_refurbished=not include_outlet,
         include_outlet=include_outlet,
+        ai_requirements=ai_requirements,
     )
 
     client = PrisGeekClient()
@@ -370,6 +377,64 @@ def run_price_check_now(send_webhooks: bool = False) -> dict[str, Any]:
     if _remote_url():
         return _remote_request("POST", "/api/check", {"send_webhooks": send_webhooks})
     return run_check_cycle(send_webhooks=send_webhooks)
+
+
+@mcp.tool()
+def ai_analyze_product(
+    public_id_or_url: str,
+    target_price: float | None = None,
+    ai_requirements: str = "",
+) -> dict[str, Any]:
+    """Run an AI evaluation of price trajectory, specs, SweClockers awards, and user criteria."""
+    if _remote_url():
+        return _remote_request(
+            "POST",
+            "/api/ai/analyze-product",
+            {
+                "public_id": public_id_or_url,
+                "target_price": target_price,
+                "ai_requirements": ai_requirements,
+            },
+            timeout=60.0,
+        )
+    from ai_advisor import analyze_product_deal
+
+    return analyze_product_deal(
+        public_id_or_url,
+        target_price=target_price,
+        ai_requirements=ai_requirements,
+    )
+
+
+@mcp.tool()
+def ai_generate_deal_digest(
+    profile: str | None = None,
+    send_notification: bool = False,
+) -> dict[str, Any]:
+    """Generate a curated Top 5 AI deal digest across Prisfall, Medlemsfynd, and Fyndvaror."""
+    if _remote_url():
+        return _remote_request(
+            "POST",
+            "/api/ai/digest",
+            {"profile": profile, "send_notification": send_notification},
+            timeout=60.0,
+        )
+    from ai_advisor import generate_ai_deal_digest
+
+    return generate_ai_deal_digest(
+        custom_profile=profile,
+        send_notification=send_notification,
+    )
+
+
+@mcp.tool()
+def ai_find_alternatives() -> dict[str, Any]:
+    """Scan today's price drops and member deals for cross-tier upgrades matching active watches."""
+    if _remote_url():
+        return _remote_request("POST", "/api/ai/alternatives", {}, timeout=60.0)
+    from ai_advisor import find_cross_tier_alternatives
+
+    return find_cross_tier_alternatives()
 
 
 if __name__ == "__main__":

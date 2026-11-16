@@ -143,6 +143,36 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                 and trigger_reason is not None
                 and should_send_alert("product", watch["id"], pid, current_price)
             ):
+                ai_note = ""
+                if watch.get("ai_requirements") or send_webhooks:
+                    try:
+                        from ai_advisor import analyze_product_deal
+
+                        verdict = analyze_product_deal(
+                            pid,
+                            target_price=float(watch["target_price"]),
+                            ai_requirements=str(watch.get("ai_requirements") or ""),
+                            watch_id=int(watch["id"]),
+                        )
+                        if watch.get("ai_requirements") and verdict.get("matches_requirements") is False:
+                            logger.info(
+                                "Suppressed alert for %s due to AI requirement check: %s",
+                                details["name"],
+                                verdict.get("spec_check"),
+                            )
+                            trigger_reason = None
+                        elif verdict.get("short_summary"):
+                            badge = verdict.get("verdict_badge") or ""
+                            ai_note = f"{badge}: {verdict['short_summary']}".strip()
+                    except Exception as exc:
+                        logger.debug("AI product vetting skipped for %s: %s", pid, exc)
+
+            if (
+                current_price is not None
+                and trigger_reason is not None
+                and should_send_alert("product", watch["id"], pid, current_price)
+            ):
+                full_reason = f"{trigger_reason} — {ai_note}" if ai_note else trigger_reason
                 alert_payload = {
                     "watch_type": "product",
                     "watch_id": watch["id"],
@@ -155,7 +185,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     "lowest_30d_price": details.get("lowest_30d_price"),
                     "lowest_all_time_price": details.get("lowest_all_time_price"),
                     "deal_assessment": details.get("deal_assessment"),
-                    "trigger_reason": trigger_reason,
+                    "trigger_reason": full_reason,
                     "url": details["url"],
                 }
                 notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)
@@ -220,6 +250,25 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                 }
                 for m in matched_items[:5]
             ]
+
+            vetted_map: dict[int, dict[str, Any]] = {}
+            if qwatch.get("ai_requirements") and matched_items:
+                try:
+                    from ai_advisor import vet_interest_watch_matches
+
+                    ai_res = vet_interest_watch_matches(qwatch, matched_items[:8])
+                    for entry in ai_res.get("vetted") or []:
+                        if entry.get("public_id") is not None:
+                            vetted_map[int(entry["public_id"])] = entry
+                    for tp in top_preview:
+                        v = vetted_map.get(int(tp["public_id"]))
+                        if v:
+                            tp["ai_score"] = v.get("score")
+                            tp["ai_approved"] = v.get("approved")
+                            tp["ai_note"] = v.get("note")
+                except Exception as exc:
+                    logger.debug("AI interest vetting skipped for %s: %s", qwatch["id"], exc)
+
             update_query_watch_results(
                 qwatch["id"],
                 match_count=len(matched_items),
@@ -244,6 +293,15 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                 if price > float(qwatch["target_price"]):
                     continue
 
+                v = vetted_map.get(pid)
+                if v and v.get("approved") is False:
+                    logger.info(
+                        "Suppressed interest alert for %s due to AI vetting: %s",
+                        item["name"],
+                        v.get("note"),
+                    )
+                    continue
+
                 record_price_observation(
                     public_id=pid,
                     product_name=item["name"],
@@ -266,6 +324,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                 )
 
                 if should_send_alert("query", qwatch["id"], pid, price):
+                    ai_suffix = f" — AI ({v.get('score')}/10): {v.get('note')}" if v and v.get("note") else ""
                     alert_payload = {
                         "watch_type": "query",
                         "watch_id": qwatch["id"],
@@ -276,7 +335,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                         "total_price": item.get("lowest_total_price"),
                         "target_price": qwatch["target_price"],
                         "retailer": item.get("best_retailer"),
-                        "trigger_reason": "Intressebevakning under maxpris",
+                        "trigger_reason": f"Intressebevakning under maxpris{ai_suffix}",
                         "url": item["url"],
                     }
                     notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)

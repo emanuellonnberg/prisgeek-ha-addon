@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY db.py prisgeek_client.py notifier.py watcher.py mcp_server.py dashboard.py addon_entrypoint.py /app/
+COPY db.py prisgeek_client.py notifier.py ai_advisor.py watcher.py mcp_server.py dashboard.py addon_entrypoint.py /app/
 
 EXPOSE 8050
 

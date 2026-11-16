@@ -1,0 +1,6 @@
+{
+  "HA_WEBHOOK_URL": "http://homeassistant.local:8123/api/webhook/black_friday_alert",
+  "EXTRA_WEBHOOK_URL": "",
+  "WEBHOOK_ENABLED": true,
+  "PRISGEEK_REMOTE_URL": "http://homeassistant.local:8050"
+}

@@ -1,0 +1,29 @@
+name: "PrisGeek Price Tracker"
+version: "1.0.0"
+slug: "prisgeek_tracker"
+description: "Swedish tech price tracker for PrisGeek with Web Dashboard, native Home Assistant sensors, and MCP API"
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8050
+panel_icon: "mdi:tag-multiple"
+panel_title: "PrisGeek"
+homeassistant_api: true
+ports:
+  8050/tcp: 8050
+ports_description:
+  8050/tcp: "Web Dashboard & Remote MCP API (for Antigravity IDE on PC)"
+options:
+  check_interval_minutes: 60
+  webhook_id: "black_friday_alert"
+  push_ha_sensors: true
+  notify_service: "auto"
+schema:
+  check_interval_minutes: "int(5,1440)"
+  webhook_id: "str?"
+  push_ha_sensors: "bool"
+  notify_service: "str?"

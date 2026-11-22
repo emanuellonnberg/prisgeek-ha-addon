@@ -18,6 +18,7 @@ from ai_advisor import (
     analyze_product_deal,
     find_cross_tier_alternatives,
     generate_ai_deal_digest,
+    suggest_similar_products,
     vet_interest_watch_matches,
 )
 from db import (
@@ -265,6 +266,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .review-links-compact a.badge-review {
       font-size: 0.7rem;
       padding: 2px 6px;
+    }
+    .sim-panel {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+    .dir-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 8px 0;
+    }
+    .dir-chip {
+      background: var(--surface);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .dir-chip:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .dir-chip.active {
+      background: rgba(56, 189, 248, 0.18);
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .sim-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 11px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
     }
 
     .deals-grid {
@@ -730,6 +772,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       medlemsfyndDeals: [],
       fyndvarorItems: [],
       topMatches: [],
+      similarSuggestions: [],
+      selectedSimDir: "same_tier",
     };
     let pendingModalPid = null;
     let editingProductId = null;
@@ -847,6 +891,95 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>`;
     }
 
+    function selectSimDir(btn, dirKey) {
+      state.selectedSimDir = dirKey;
+      const group = btn.closest(".dir-chips");
+      if (group) {
+        group.querySelectorAll(".dir-chip").forEach(el => el.classList.remove("active"));
+      }
+      btn.classList.add("active");
+    }
+
+    function renderSimilarSuggestionsHtml(res) {
+      if (!res) return "";
+      const items = res.suggestions || [];
+      state.similarSuggestions = items;
+      const queriesHint = (res.search_queries_used || []).length
+        ? `<div class="subtext" style="margin-bottom:8px;">Sökte på: ${esc(res.search_queries_used.join(" · "))} (${Number(res.candidate_pool_size || 0)} live-kandidater granskade)</div>`
+        : "";
+      const summaryHtml = res.summary
+        ? `<div style="font-size:0.86rem; margin-bottom:8px;"><strong>AI-sammanfattning:</strong> ${esc(res.summary)}</div>`
+        : "";
+      if (!items.length) {
+        return `${summaryHtml}${queriesHint}<div class="empty-msg">Inga matchande alternativ hittades i PrisGeeks katalog för denna riktning.</div>`;
+      }
+      return `
+        ${summaryHtml}
+        ${queriesHint}
+        <div class="deals-grid" style="grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));">
+          ${items.map((s, idx) => {
+            let diffBadge = "";
+            if (s.price_diff_kr !== null && s.price_diff_kr !== undefined) {
+              const dk = Math.round(Number(s.price_diff_kr));
+              const dp = s.price_diff_pct !== null && s.price_diff_pct !== undefined ? `${dk > 0 ? "+" : ""}${s.price_diff_pct}%` : "";
+              const sign = dk > 0 ? "+" : "";
+              const cls = dk <= 0 ? "badge-green" : "badge-amber";
+              diffBadge = `<span class="badge ${cls}">${sign}${dk.toLocaleString("sv-SE")} kr${dp ? ` (${dp})` : ""}</span>`;
+            }
+            return `
+              <div class="sim-card">
+                <div class="deal-meta">
+                  <span class="badge badge-purple">AI ${Number(s.match_score || 8)}/10 · ${esc(s.tag || "")}</span>
+                  ${diffBadge}
+                </div>
+                <div style="font-weight:600; font-size:0.9rem;">
+                  <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.name)}</a>
+                </div>
+                <div style="font-size:0.85rem;">
+                  <strong>${fmtKr(s.lowest_price)}</strong> @ ${renderStoreLink(s.best_retailer, s.best_store_url)}
+                  ${s.offer_count ? `<span class="subtext">(${Number(s.offer_count)} butiker)</span>` : ""}
+                </div>
+                <div style="font-size:0.82rem;">${esc(s.why_it_fits || "")}</div>
+                ${s.tradeoff ? `<div class="subtext"><strong>Kompromiss:</strong> ${esc(s.tradeoff)}</div>` : ""}
+                ${renderReviewLinksHtml(s.external_review_links || [], [], true)}
+                <div class="actions-cell" style="margin-top:4px;">
+                  <button class="btn-secondary btn-sm" type="button" onclick="openProductDetailModal(${Number(s.public_id)})">Graf &amp; Tester</button>
+                  <button class="btn-primary btn-sm" type="button" onclick="openWatchFromList('similarSuggestions', ${idx})">Bevaka</button>
+                </div>
+              </div>`;
+          }).join("")}
+        </div>`;
+    }
+
+    async function runSimilarProducts(publicId) {
+      const box = document.getElementById("detail-similar-box");
+      const btn = document.getElementById("sim-search-btn");
+      if (!box) return;
+      const customPrompt = (document.getElementById("sim-custom-prompt")?.value || "").trim();
+      const maxPriceRaw = (document.getElementById("sim-max-price")?.value || "").trim();
+      const payload = {
+        public_id: Number(publicId),
+        direction: state.selectedSimDir || "same_tier",
+        custom_prompt: customPrompt,
+        in_stock_only: true,
+      };
+      if (maxPriceRaw) payload.max_price = Number(maxPriceRaw);
+
+      if (btn) { btn.disabled = true; btn.textContent = "Söker alternativ..."; }
+      box.innerHTML = `<div class="empty-msg">Planerar sökningar i PrisGeek &amp; rankar liknande produkter med AI...</div>`;
+      try {
+        const res = await apiFetch("/api/ai/similar-products", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        box.innerHTML = renderSimilarSuggestionsHtml(res);
+      } catch (err) {
+        box.innerHTML = `<div class="empty-msg">Kunde inte hämta liknande produkter: ${esc(err.message)}</div>`;
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "Hitta liknande"; }
+      }
+    }
+
     async function runAiAnalyzeProduct(publicId, targetPrice = null, watchId = null) {
       const box = document.getElementById("detail-ai-box");
       if (!box) return;
@@ -895,6 +1028,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const reviews = det.extra_context?.reviews || [];
         const w = watchId ? (state.watches?.product_watches || []).find(x => Number(x.id) === Number(watchId)) : null;
         const cachedVerdict = w?.ai_verdict?.verdict_badge ? renderAiVerdictHtml(w.ai_verdict) : "";
+        state.selectedSimDir = "same_tier";
+        state.similarSuggestions = [];
 
         body.innerHTML = `
           <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; font-size:0.86rem;">
@@ -908,6 +1043,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           ${renderReviewLinksHtml(det.external_review_links || [], reviews, false)}
           <div id="detail-ai-box">${cachedVerdict}</div>
+          <div class="sim-panel">
+            <div style="font-weight:600; font-size:0.9rem;">Hitta liknande produkter (AI)</div>
+            <div class="subtext">Välj riktning och/eller beskriv vad som är viktigt jämfört med denna produkt:</div>
+            <div class="dir-chips" id="sim-dir-chips">
+              <button type="button" class="dir-chip" onclick="selectSimDir(this, 'cheaper')">💰 Billigare</button>
+              <button type="button" class="dir-chip active" onclick="selectSimDir(this, 'same_tier')">⚖️ Bättre värde</button>
+              <button type="button" class="dir-chip" onclick="selectSimDir(this, 'upgrade')">🚀 Steget upp</button>
+              <button type="button" class="dir-chip" onclick="selectSimDir(this, 'quality')">🔇 Tystare / Kvalitet</button>
+            </div>
+            <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+              <input id="sim-custom-prompt" type="text" style="flex:1; min-width:210px;" placeholder="t.ex. A2-klassat för Jetson, max 280mm, vit färg..." />
+              <input id="sim-max-price" type="number" step="1" min="0" style="width:125px;" placeholder="Maxpris (kr)" />
+              <button id="sim-search-btn" class="btn-primary btn-sm" type="button" onclick="runSimilarProducts(${Number(publicId)})">Hitta liknande</button>
+            </div>
+            <div id="detail-similar-box" style="margin-top:10px;"></div>
+          </div>
           <div style="margin-bottom:14px;">${chartSvg}</div>
           <h4 style="margin:10px 0 6px;">Butikserbjudanden (${offers.length})</h4>
           <div class="table-wrap">
@@ -2125,6 +2276,38 @@ async def api_ai_alternatives(_request: Request) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+async def api_ai_similar_products(request: Request) -> JSONResponse:
+    """Find directed live-catalog alternatives similar to a specific product."""
+    try:
+        body = await request.json()
+        public_id = body.get("public_id")
+        if not public_id:
+            return JSONResponse({"error": "public_id is required"}, status_code=400)
+        direction = str(body.get("direction") or "same_tier")
+        custom_prompt = str(body.get("custom_prompt") or "")
+        max_raw = body.get("max_price")
+        max_price = float(max_raw) if max_raw not in (None, "") else None
+        in_stock_only = _parse_bool(body.get("in_stock_only"), True)
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"error": f"Invalid payload: {exc}"}, status_code=400)
+
+    try:
+        res = await run_in_threadpool(
+            suggest_similar_products,
+            str(public_id),
+            direction=direction,
+            custom_prompt=custom_prompt,
+            max_price=max_price,
+            in_stock_only=in_stock_only,
+        )
+        return JSONResponse(res)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except Exception as exc:
+        logger.exception("AI similar products failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 init_db()
 
 app = Starlette(
@@ -2147,6 +2330,7 @@ app = Starlette(
         Route("/api/ai/vet-interest/{watch_id:int}", api_ai_vet_interest, methods=["POST"]),
         Route("/api/ai/digest", api_ai_digest, methods=["POST"]),
         Route("/api/ai/alternatives", api_ai_alternatives, methods=["POST"]),
+        Route("/api/ai/similar-products", api_ai_similar_products, methods=["POST"]),
     ]
 )
 

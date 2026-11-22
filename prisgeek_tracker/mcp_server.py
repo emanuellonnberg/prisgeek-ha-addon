@@ -440,5 +440,38 @@ def ai_find_alternatives() -> dict[str, Any]:
     return find_cross_tier_alternatives()
 
 
+@mcp.tool()
+def ai_suggest_similar_products(
+    public_id_or_url: str,
+    direction: str = "same_tier",
+    custom_prompt: str = "",
+    max_price: float | None = None,
+    in_stock_only: bool = True,
+) -> dict[str, Any]:
+    """Suggest live PrisGeek alternatives for a product tailored to direction ('cheaper', 'same_tier', 'upgrade', 'quality', 'custom') and custom requirements."""
+    if _remote_url():
+        return _remote_request(
+            "POST",
+            "/api/ai/similar-products",
+            {
+                "public_id": public_id_or_url,
+                "direction": direction,
+                "custom_prompt": custom_prompt,
+                "max_price": max_price,
+                "in_stock_only": in_stock_only,
+            },
+            timeout=90.0,
+        )
+    from ai_advisor import suggest_similar_products
+
+    return suggest_similar_products(
+        public_id_or_url,
+        direction=direction,
+        custom_prompt=custom_prompt,
+        max_price=max_price,
+        in_stock_only=in_stock_only,
+    )
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

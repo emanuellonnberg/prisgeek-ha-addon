@@ -35,6 +35,39 @@ PREFERRED_AI_ENTITIES = (
     "ai_task.google_ai_task",
 )
 
+SIMILAR_DIRECTIONS: dict[str, tuple[str, str, float, float]] = {
+    "cheaper": (
+        "Billigare alternativ",
+        "Hitta billigare likvärdiga alternativ som behåller de viktigaste egenskaperna men kostar märkbart mindre.",
+        0.40,
+        0.96,
+    ),
+    "same_tier": (
+        "Bättre värde i samma prisklass",
+        "Hitta starkare konkurrenter i ungefär samma prisklass med bättre prestanda, omdömen eller valuta för pengarna.",
+        0.75,
+        1.18,
+    ),
+    "upgrade": (
+        "Steget upp (uppgradering)",
+        "Hitta tydliga uppgraderingar ett steg upp i prestanda, kapacitet, specifikationer eller generation som är prisvärda.",
+        1.00,
+        1.65,
+    ),
+    "quality": (
+        "Tystare / högre kvalitet",
+        "Prioritera lägre ljudnivå, bättre kylning, byggkvalitet, komponenter, hållbarhet eller längre garanti.",
+        0.75,
+        1.45,
+    ),
+    "custom": (
+        "Anpassad riktning",
+        "Följ användarens egna önskemål noggrant.",
+        0.40,
+        1.80,
+    ),
+}
+
 
 def _select_ai_entity(
     client: httpx.Client, ha_core_url: str, headers: dict[str, str], cfg: dict[str, Any]
@@ -319,6 +352,291 @@ def find_cross_tier_alternatives() -> dict[str, Any]:
     }
     set_setting("last_alternatives", result)
     return result
+
+
+def _plan_similar_search_queries(
+    source_info: dict[str, Any],
+    direction_label: str,
+    guidance: str,
+    custom_prompt: str,
+) -> list[str]:
+    """Ask HA AI for 3-5 concise PrisGeek search queries targeting competing models."""
+    instructions = (
+        "Du hjälper användaren hitta liknande eller konkurrerande produkter i en svensk prisdatabas (PrisGeek).\n"
+        "Utifrån källprodukten och användarens önskade riktning, ta fram 3 till 5 korta söktermer "
+        "(2–4 ord per sökning, bara produktnamn/serie/nyckelspec – inga priser eller butiksnamn) som hittar relevanta konkurrenter eller rätt uppgraderingar.\n"
+        'Svara ENDAST med giltig JSON: {"queries": ["sökterm 1", "sökterm 2", "sökterm 3"]}\n\n'
+        f"Källprodukt: {json.dumps(source_info, ensure_ascii=False)}\n"
+        f"Riktning: {direction_label} ({guidance})\n"
+        f"Extra önskemål från användaren: {custom_prompt or 'Inga extra önskemål.'}"
+    )
+    try:
+        raw_reply = _call_ha_ai_task("PrisGeek Liknande Sökplan", instructions)
+        parsed = _extract_json(raw_reply)
+        if isinstance(parsed, dict) and isinstance(parsed.get("queries"), list):
+            queries = [str(q).strip() for q in parsed["queries"] if str(q).strip()]
+            return list(dict.fromkeys(queries))[:5]
+    except Exception as exc:
+        logger.debug("Stage 1 similar query planning skipped: %s", exc)
+    return []
+
+
+def _collect_similar_candidates(
+    client: PrisGeekClient,
+    details: dict[str, Any],
+    queries: list[str],
+    *,
+    min_p: float | None,
+    max_p: float | None,
+    explicit_max_price: float | None,
+    in_stock_only: bool,
+) -> list[dict[str, Any]]:
+    """Gather deduplicated live PrisGeek candidates from AI search queries and category peers."""
+    target_pid = int(details["public_id"])
+    by_pid: dict[int, dict[str, Any]] = {}
+
+    def _add(items: list[dict[str, Any]], *, from_search: bool) -> None:
+        for item in items:
+            raw_pid = item.get("public_id")
+            if raw_pid is None:
+                continue
+            pid = int(raw_pid)
+            if pid == target_pid:
+                continue
+            existing = by_pid.get(pid)
+            if existing is None:
+                entry = dict(item)
+                entry["_from_search"] = from_search
+                by_pid[pid] = entry
+            elif from_search and not existing.get("_from_search"):
+                existing["_from_search"] = True
+
+    for q in queries[:5]:
+        try:
+            hits = client.search_products(
+                q,
+                max_price=max_p,
+                in_stock_only=in_stock_only,
+                exclude_refurbished=True,
+                limit=12,
+            )
+            _add(hits, from_search=True)
+        except Exception as exc:
+            logger.debug("Similar candidate search failed for %r: %s", q, exc)
+
+    try:
+        peers = client.find_category_peers(
+            details.get("category_id"),
+            subcategory=details.get("subcategory"),
+            min_price=min_p,
+            max_price=max_p,
+            exclude_public_id=target_pid,
+            in_stock_only=in_stock_only,
+            exclude_refurbished=True,
+            limit=25,
+        )
+        _add(peers, from_search=False)
+    except Exception as exc:
+        logger.debug("Category peer lookup failed for %s: %s", target_pid, exc)
+
+    if len(by_pid) < 4:
+        try:
+            broad_peers = client.find_category_peers(
+                details.get("category_id"),
+                subcategory=details.get("subcategory"),
+                min_price=None,
+                max_price=explicit_max_price,
+                exclude_public_id=target_pid,
+                in_stock_only=in_stock_only,
+                exclude_refurbished=True,
+                limit=25,
+            )
+            _add(broad_peers, from_search=False)
+        except Exception as exc:
+            logger.debug("Broad category fallback failed for %s: %s", target_pid, exc)
+
+    ranked = sorted(
+        by_pid.values(),
+        key=lambda item: (
+            not bool(item.get("_from_search")),
+            not bool(item.get("in_stock")),
+            -min(int(item.get("offer_count") or 0), 12),
+            float(item.get("lowest_price") or 0.0),
+        ),
+    )
+    return ranked[:28]
+
+
+def suggest_similar_products(
+    public_id_or_url: str | int,
+    *,
+    direction: str = "same_tier",
+    custom_prompt: str = "",
+    max_price: float | None = None,
+    in_stock_only: bool = True,
+) -> dict[str, Any]:
+    """Find and rank live PrisGeek product alternatives tailored to a chosen direction and criteria."""
+    dir_key = direction.strip().lower() if direction else "same_tier"
+    if dir_key not in SIMILAR_DIRECTIONS:
+        dir_key = "custom" if custom_prompt.strip() else "same_tier"
+    direction_label, guidance, min_mult, max_mult = SIMILAR_DIRECTIONS[dir_key]
+    clean_custom = (custom_prompt or "").strip()
+
+    client = PrisGeekClient()
+    try:
+        details = client.get_product_details(public_id_or_url)
+        source_price = details.get("lowest_price")
+        min_p: float | None = round(float(source_price) * min_mult, 2) if source_price else None
+        max_p: float | None = round(float(source_price) * max_mult, 2) if source_price else None
+        if max_price is not None:
+            cap = float(max_price)
+            max_p = min(max_p, cap) if max_p is not None else cap
+            if min_p is not None and min_p > cap:
+                min_p = max(0.0, cap * 0.5)
+
+        source_info = {
+            "public_id": details["public_id"],
+            "name": details["name"],
+            "brand": details.get("brand"),
+            "category": details.get("category"),
+            "subcategory": details.get("subcategory"),
+            "lowest_price_sek": source_price,
+            "specs": details.get("specs"),
+        }
+
+        queries = _plan_similar_search_queries(
+            source_info, direction_label, guidance, clean_custom
+        )
+        candidates = _collect_similar_candidates(
+            client,
+            details,
+            queries,
+            min_p=min_p,
+            max_p=max_p,
+            explicit_max_price=float(max_price) if max_price is not None else None,
+            in_stock_only=in_stock_only,
+        )
+    finally:
+        client.close()
+
+    source_summary = {
+        "public_id": details["public_id"],
+        "name": details["name"],
+        "brand": details.get("brand"),
+        "category": details.get("category"),
+        "lowest_price": source_price,
+        "best_retailer": details.get("best_retailer"),
+        "url": details.get("url"),
+    }
+
+    if not candidates:
+        return {
+            "source_product": source_summary,
+            "direction": dir_key,
+            "direction_label": direction_label,
+            "custom_prompt": clean_custom,
+            "summary": "Inga tillgängliga alternativ hittades i PrisGeeks katalog inom valt prisintervall.",
+            "search_queries_used": queries,
+            "candidate_pool_size": 0,
+            "suggestions": [],
+            "generated_at": utc_now_iso(),
+        }
+
+    candidates_by_pid = {int(c["public_id"]): c for c in candidates}
+    compact_candidates = [
+        {
+            "public_id": c["public_id"],
+            "name": c["name"],
+            "brand": c.get("brand"),
+            "category": c.get("category"),
+            "lowest_price_sek": c.get("lowest_price"),
+            "best_retailer": c.get("best_retailer"),
+            "in_stock": c.get("in_stock"),
+            "offer_count": c.get("offer_count"),
+            "specs": c.get("specs"),
+        }
+        for c in candidates
+    ]
+
+    instructions = (
+        "Du är en svensk hårdvarurådgivare. Välj ut upp till 5 av de BÄSTA liknande produkterna/alternativen "
+        "från kandidatlistan utifrån användarens riktning och extra önskemål.\n"
+        "REGLER:\n"
+        "- Välj ENDAST public_id som finns exakt i kandidatlistan (hitta aldrig på egna produkter eller priser).\n"
+        "- Rensa bort irrelevanta tillbehör, kablar eller fel produktkategori.\n"
+        "- Svara ENDAST med giltig JSON i exakt detta format:\n"
+        '{"summary": "1-2 korta meningar på svenska som sammanfattar rekommendationen", '
+        '"suggestions": [{"public_id": 123, "match_score": 9, "tag": "Bäst för kraven", '
+        '"why_it_fits": "1-2 meningar om varför den passar riktningen", '
+        '"tradeoff": "1 kort mening om kompromiss/skillnad mot originalet"}]}\n\n'
+        f"Källprodukt:\n{json.dumps(source_info, ensure_ascii=False)}\n\n"
+        f"Riktning: {direction_label} — {guidance}\n"
+        f"Användarens extra önskemål: {clean_custom or 'Inga extra önskemål.'}\n\n"
+        f"Kandidater (live från PrisGeek):\n{json.dumps(compact_candidates, ensure_ascii=False)}"
+    )
+
+    raw_reply = _call_ha_ai_task("PrisGeek Liknande Alternativ", instructions)
+    parsed = _extract_json(raw_reply)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected JSON object from AI, got: {parsed}")
+
+    suggestions: list[dict[str, Any]] = []
+    seen_out: set[int] = set()
+    for raw_sug in (parsed.get("suggestions") or []):
+        if not isinstance(raw_sug, dict) or raw_sug.get("public_id") is None:
+            continue
+        try:
+            pid = int(raw_sug["public_id"])
+        except (TypeError, ValueError):
+            continue
+        cand = candidates_by_pid.get(pid)
+        if not cand or pid in seen_out:
+            continue
+        seen_out.add(pid)
+
+        cand_price = cand.get("lowest_price")
+        diff_kr: float | None = None
+        diff_pct: float | None = None
+        if cand_price is not None and source_price:
+            diff_kr = round(float(cand_price) - float(source_price), 2)
+            diff_pct = round(diff_kr / float(source_price) * 100.0, 1)
+
+        suggestions.append(
+            {
+                "public_id": pid,
+                "name": cand["name"],
+                "brand": cand.get("brand"),
+                "category": cand.get("category"),
+                "lowest_price": cand_price,
+                "lowest_total_price": cand.get("lowest_total_price"),
+                "best_retailer": cand.get("best_retailer"),
+                "best_store_url": cand.get("best_store_url"),
+                "url": cand["url"],
+                "in_stock": cand.get("in_stock"),
+                "offer_count": cand.get("offer_count"),
+                "external_review_links": cand.get("external_review_links") or [],
+                "price_diff_kr": diff_kr,
+                "price_diff_pct": diff_pct,
+                "match_score": int(raw_sug.get("match_score") or 8),
+                "tag": str(raw_sug.get("tag") or direction_label),
+                "why_it_fits": str(raw_sug.get("why_it_fits") or ""),
+                "tradeoff": str(raw_sug.get("tradeoff") or ""),
+            }
+        )
+        if len(suggestions) >= 5:
+            break
+
+    return {
+        "source_product": source_summary,
+        "direction": dir_key,
+        "direction_label": direction_label,
+        "custom_prompt": clean_custom,
+        "summary": str(parsed.get("summary") or ""),
+        "search_queries_used": queries,
+        "candidate_pool_size": len(candidates),
+        "suggestions": suggestions,
+        "generated_at": utc_now_iso(),
+    }
 
 
 def generate_ai_deal_digest(

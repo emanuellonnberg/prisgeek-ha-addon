@@ -606,6 +606,67 @@ class PrisGeekClient:
         clean_slug = (slug or "produkt").strip("/")
         return f"{PRISGEEK_BASE}/produkt/{public_id}/{clean_slug}"
 
+    def _format_search_hit(
+        self,
+        row: dict[str, Any],
+        *,
+        in_stock_only: bool = False,
+        exclude_refurbished: bool = True,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Summarize offers, enforce price/stock filters, and format a catalog product hit."""
+        name = str(row.get("name") or "")
+        if exclude_refurbished and REFURB_NAME_RE.search(name):
+            return None
+
+        summary = summarize_offers(
+            row.get("offers"),
+            in_stock_only=in_stock_only,
+            exclude_refurbished=exclude_refurbished,
+        )
+        lowest_price = summary["lowest_price"]
+        if lowest_price is None:
+            return None
+        if min_price is not None and lowest_price < min_price:
+            return None
+        if max_price is not None and lowest_price > max_price:
+            return None
+
+        cat_obj = row.get("categories")
+        category_name = cat_obj.get("name") if isinstance(cat_obj, dict) else None
+        effective_category = category_name or row.get("subcategory")
+        public_id = row.get("public_id")
+        clean_query = clean_review_search_query(
+            name, row.get("brand"), row.get("model")
+        )
+        return {
+            "public_id": public_id,
+            "uuid": row.get("id"),
+            "name": name,
+            "brand": row.get("brand"),
+            "model": row.get("model"),
+            "mpn": row.get("mpn"),
+            "category": effective_category,
+            "subcategory": row.get("subcategory"),
+            "url": self._format_product_url(public_id, row.get("slug")),
+            "lowest_price": lowest_price,
+            "lowest_total_price": summary["lowest_total_price"],
+            "best_retailer": summary["best_retailer"],
+            "best_store_url": summary["best_store_url"],
+            "in_stock": summary["in_stock"],
+            "offer_count": summary["offer_count"],
+            "specs": row.get("specs"),
+            "offers": summary["offers"][:3],
+            "clean_model_query": clean_query,
+            "external_review_links": build_external_review_links(
+                name,
+                brand=row.get("brand"),
+                model=row.get("model"),
+                category=effective_category,
+            ),
+        }
+
     def search_products(
         self,
         query: str,
@@ -664,64 +725,93 @@ class PrisGeekClient:
         lower_tokens = [t.lower() for t in tokens]
 
         for row in rows:
-            name = str(row.get("name") or "")
-            if exclude_refurbished and REFURB_NAME_RE.search(name):
-                continue
-
             blob = _product_searchable_blob(row)
             if not all(any(v in blob for v in _token_variants(tok)) for tok in lower_tokens):
                 continue
-
-            summary = summarize_offers(
-                row.get("offers"),
+            hit = self._format_search_hit(
+                row,
                 in_stock_only=in_stock_only,
                 exclude_refurbished=exclude_refurbished,
+                max_price=max_price,
             )
-            lowest_price = summary["lowest_price"]
-            if lowest_price is None:
-                continue
-            if max_price is not None and lowest_price > max_price:
-                continue
-
-            cat_obj = row.get("categories")
-            category_name = cat_obj.get("name") if isinstance(cat_obj, dict) else None
-            effective_category = category_name or row.get("subcategory")
-            public_id = row.get("public_id")
-            clean_query = clean_review_search_query(
-                name, row.get("brand"), row.get("model")
-            )
-            results.append(
-                {
-                    "public_id": public_id,
-                    "uuid": row.get("id"),
-                    "name": name,
-                    "brand": row.get("brand"),
-                    "model": row.get("model"),
-                    "mpn": row.get("mpn"),
-                    "category": effective_category,
-                    "url": self._format_product_url(public_id, row.get("slug")),
-                    "lowest_price": lowest_price,
-                    "lowest_total_price": summary["lowest_total_price"],
-                    "best_retailer": summary["best_retailer"],
-                    "best_store_url": summary["best_store_url"],
-                    "in_stock": summary["in_stock"],
-                    "offer_count": summary["offer_count"],
-                    "specs": row.get("specs"),
-                    "offers": summary["offers"][:3],
-                    "clean_model_query": clean_query,
-                    "external_review_links": build_external_review_links(
-                        name,
-                        brand=row.get("brand"),
-                        model=row.get("model"),
-                        category=effective_category,
-                    ),
-                }
-            )
+            if hit is not None:
+                results.append(hit)
 
         results.sort(
             key=lambda item: (not item["in_stock"], item["lowest_price"], item["lowest_total_price"] or 0.0)
         )
         return results[:limit]
+
+    def find_category_peers(
+        self,
+        category_id: str | None,
+        *,
+        subcategory: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        exclude_public_id: int | None = None,
+        in_stock_only: bool = True,
+        exclude_refurbished: bool = True,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Query products in the same PrisGeek category/subcategory within optional price bounds."""
+        if not category_id:
+            return []
+
+        inner_select = PRODUCT_SELECT.replace("offers(", "offers!inner(", 1)
+        fetch_limit = max(limit * 3, 60)
+
+        def _query(subcat: str | None) -> list[dict[str, Any]]:
+            params: list[tuple[str, str]] = [
+                ("select", inner_select),
+                ("category_id", f"eq.{category_id}"),
+                ("offers.market", "eq.se"),
+                ("offers.price_flag", "is.null"),
+                ("limit", str(fetch_limit)),
+            ]
+            if subcat:
+                params.append(("subcategory", f"eq.{subcat}"))
+            if min_price is not None and min_price > 0:
+                params.append(("offers.price", f"gte.{int(min_price)}"))
+            if max_price is not None and max_price > 0:
+                params.append(("offers.price", f"lte.{int(max_price) + 1}"))
+            return self._supabase_get("products", params) or []
+
+        rows = _query(subcategory)
+        hits: list[dict[str, Any]] = []
+        seen_pids: set[int] = set()
+
+        def _collect(raw_rows: list[dict[str, Any]]) -> None:
+            for row in raw_rows:
+                pid = row.get("public_id")
+                if pid is None:
+                    continue
+                pid_int = int(pid)
+                if pid_int == exclude_public_id or pid_int in seen_pids:
+                    continue
+                hit = self._format_search_hit(
+                    row,
+                    in_stock_only=in_stock_only,
+                    exclude_refurbished=exclude_refurbished,
+                    min_price=min_price,
+                    max_price=max_price,
+                )
+                if hit is not None:
+                    seen_pids.add(pid_int)
+                    hits.append(hit)
+
+        _collect(rows)
+        if subcategory and len(hits) < max(8, limit // 2):
+            _collect(_query(None))
+
+        hits.sort(
+            key=lambda item: (
+                not item["in_stock"],
+                -min(int(item.get("offer_count") or 0), 12),
+                item["lowest_price"],
+            )
+        )
+        return hits[:limit]
 
     def _extract_ssr_history_metrics(
         self, product_url: str, product_uuid: str | None = None
@@ -893,6 +983,8 @@ class PrisGeekClient:
             "model": row.get("model"),
             "mpn": row.get("mpn"),
             "category": effective_category,
+            "category_id": row.get("category_id"),
+            "subcategory": row.get("subcategory"),
             "url": product_url,
             "image_url": row.get("image_url"),
             "lowest_price": lowest_price,

@@ -308,6 +308,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-direction: column;
       gap: 6px;
     }
+    .spec-diff-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 2px;
+    }
+    .spec-diff-item {
+      font-size: 0.72rem;
+      color: var(--muted);
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px 6px;
+    }
 
     .deals-grid {
       display: grid;
@@ -741,7 +755,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <dialog class="modal modal-wide" id="detail-modal">
     <div class="deal-meta" style="margin-bottom: 10px;">
-      <h3 id="detail-title" style="margin: 0;">Produktdetaljer</h3>
+      <div style="display:flex; align-items:center; gap:10px; min-width:0; flex:1;">
+        <button id="detail-back-btn" type="button" class="btn-secondary btn-sm" style="display:none;" onclick="goBackDetailModal()">← Tillbaka</button>
+        <h3 id="detail-title" style="margin: 0;">Produktdetaljer</h3>
+      </div>
       <button type="button" class="btn-secondary btn-sm" onclick="document.getElementById('detail-modal').close()">Stäng</button>
     </div>
     <div id="detail-body"></div>
@@ -774,6 +791,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       topMatches: [],
       similarSuggestions: [],
       selectedSimDir: "same_tier",
+      detailHistory: [],
+      currentDetail: null,
+      lastSimilarResult: null,
     };
     let pendingModalPid = null;
     let editingProductId = null;
@@ -904,15 +924,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!res) return "";
       const items = res.suggestions || [];
       state.similarSuggestions = items;
+      state.lastSimilarResult = res;
       const queriesHint = (res.search_queries_used || []).length
         ? `<div class="subtext" style="margin-bottom:8px;">Sökte på: ${esc(res.search_queries_used.join(" · "))} (${Number(res.candidate_pool_size || 0)} live-kandidater granskade)</div>`
         : "";
       const summaryHtml = res.summary
         ? `<div style="font-size:0.86rem; margin-bottom:8px;"><strong>AI-sammanfattning:</strong> ${esc(res.summary)}</div>`
         : "";
+      const interestBtnHtml = res.suggested_interest_watch
+        ? `<div style="margin-top:10px; display:flex; justify-content:flex-end;">
+            <button type="button" class="btn-secondary btn-sm" onclick="prefillInterestFromSimilar()">+ Skapa Intressebevakning av riktningen</button>
+           </div>`
+        : "";
       if (!items.length) {
-        return `${summaryHtml}${queriesHint}<div class="empty-msg">Inga matchande alternativ hittades i PrisGeeks katalog för denna riktning.</div>`;
+        return `${summaryHtml}${queriesHint}<div class="empty-msg">Inga matchande alternativ hittades i PrisGeeks katalog för denna riktning.</div>${interestBtnHtml}`;
       }
+      const activeWatchId = state.currentDetail?.watchId;
       return `
         ${summaryHtml}
         ${queriesHint}
@@ -926,6 +953,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               const cls = dk <= 0 ? "badge-green" : "badge-amber";
               diffBadge = `<span class="badge ${cls}">${sign}${dk.toLocaleString("sv-SE")} kr${dp ? ` (${dp})` : ""}</span>`;
             }
+            const specDiffHtml = (s.spec_diffs && s.spec_diffs.length)
+              ? `<div class="spec-diff-list">${s.spec_diffs.map(d => `<span class="spec-diff-item"><strong>${esc(d.key)}:</strong> ${esc(d.source)} → ${esc(d.candidate)}</span>`).join("")}</div>`
+              : "";
+            const swapBtnHtml = activeWatchId
+              ? `<button class="btn-secondary btn-sm" type="button" onclick="swapWatchToSuggestion(${idx})" title="Byt ut nuvarande bevakning till denna produkt">Byt bevakning</button>`
+              : "";
             return `
               <div class="sim-card">
                 <div class="deal-meta">
@@ -941,14 +974,154 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
                 <div style="font-size:0.82rem;">${esc(s.why_it_fits || "")}</div>
                 ${s.tradeoff ? `<div class="subtext"><strong>Kompromiss:</strong> ${esc(s.tradeoff)}</div>` : ""}
+                ${specDiffHtml}
                 ${renderReviewLinksHtml(s.external_review_links || [], [], true)}
                 <div class="actions-cell" style="margin-top:4px;">
-                  <button class="btn-secondary btn-sm" type="button" onclick="openProductDetailModal(${Number(s.public_id)})">Graf &amp; Tester</button>
+                  <button class="btn-secondary btn-sm" type="button" onclick="openProductDetailModal(${Number(s.public_id)}, null, null, false, true)">Graf &amp; Tester</button>
+                  ${swapBtnHtml}
                   <button class="btn-primary btn-sm" type="button" onclick="openWatchFromList('similarSuggestions', ${idx})">Bevaka</button>
                 </div>
               </div>`;
           }).join("")}
+        </div>
+        ${interestBtnHtml}`;
+    }
+
+    async function swapWatchToSuggestion(idx) {
+      const s = state.similarSuggestions?.[idx];
+      const oldWatchId = state.currentDetail?.watchId;
+      if (!s || !oldWatchId) return;
+      const oldW = (state.watches?.product_watches || []).find(x => Number(x.id) === Number(oldWatchId));
+      if (!oldW) return;
+      try {
+        await apiFetch("/api/watches/product", {
+          method: "POST",
+          body: JSON.stringify({
+            public_id_or_url: String(s.public_id),
+            target_price: Number(oldW.target_price),
+            in_stock_only: Boolean(oldW.in_stock_only),
+            exclude_refurbished: Boolean(oldW.exclude_refurbished),
+            alert_on_all_time_low: oldW.alert_on_all_time_low !== 0,
+            alert_below_30d_pct: Number(oldW.alert_below_30d_pct || 0),
+            ai_requirements: oldW.ai_requirements || "",
+            notes: oldW.notes || "",
+          }),
+        });
+        await apiFetch(`/api/watches/product/${Number(oldWatchId)}`, { method: "DELETE" });
+        showToast(`Bytte bevakning till ${s.name}!`);
+        document.getElementById("detail-modal").close();
+        await loadState();
+      } catch (err) {
+        showToast(`Kunde inte byta bevakning: ${err.message}`, true);
+      }
+    }
+
+    function prefillInterestFromSimilar() {
+      const iw = state.lastSimilarResult?.suggested_interest_watch;
+      if (!iw) return;
+      document.getElementById("detail-modal").close();
+      const watchesTab = document.querySelector('.tab-btn[data-tab="watches"]');
+      if (watchesTab) watchesTab.click();
+      document.getElementById("iw-name").value = iw.name || "";
+      document.getElementById("iw-query").value = iw.search_query || "";
+      document.getElementById("iw-target").value = String(iw.target_price || "");
+      document.getElementById("iw-ai-req").value = iw.ai_requirements || "";
+      const formEl = document.getElementById("interest-watch-form");
+      if (formEl) formEl.scrollIntoView({ behavior: "smooth", block: "center" });
+      document.getElementById("iw-query").focus();
+      showToast("Förifyllde ny intressebevakning från AI-riktningen!");
+    }
+
+    function captureCurrentDetailSnapshot() {
+      if (!state.currentDetail) return null;
+      return {
+        ...state.currentDetail,
+        similarRes: state.lastSimilarResult,
+        selectedSimDir: state.selectedSimDir || "same_tier",
+        customPrompt: document.getElementById("sim-custom-prompt")?.value || "",
+        maxPrice: document.getElementById("sim-max-price")?.value || "",
+      };
+    }
+
+    function renderDetailModalFromSnapshot(snap) {
+      const { publicId, targetPrice, watchId, det } = snap;
+      state.currentDetail = snap;
+      state.selectedSimDir = snap.selectedSimDir || "same_tier";
+      state.lastSimilarResult = snap.similarRes || null;
+      state.similarSuggestions = snap.similarRes?.suggestions || [];
+
+      const backBtn = document.getElementById("detail-back-btn");
+      if (backBtn) {
+        backBtn.style.display = state.detailHistory.length ? "inline-block" : "none";
+      }
+
+      document.getElementById("detail-title").textContent = det.name;
+      const chartSvg = renderHistoryChart(det.history_series || [], targetPrice);
+      const offers = det.offers || [];
+      const reviews = det.extra_context?.reviews || [];
+      const w = watchId ? (state.watches?.product_watches || []).find(x => Number(x.id) === Number(watchId)) : null;
+      const cachedVerdict = w?.ai_verdict?.verdict_badge ? renderAiVerdictHtml(w.ai_verdict) : "";
+
+      const body = document.getElementById("detail-body");
+      body.innerHTML = `
+        <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; font-size:0.86rem;">
+          <span>Nuvarande: <strong>${fmtKr(det.lowest_price)}</strong></span>
+          <span>30d-lägsta: <strong>${fmtKr(det.lowest_30d_price)}</strong></span>
+          <span>Lägsta någonsin: <strong>${fmtKr(det.lowest_all_time_price)}</strong></span>
+          <span class="badge badge-muted">${esc(det.deal_assessment)}</span>
+          ${det.best_store_url ? `<a class="badge badge-green" style="text-decoration:none;" href="${esc(det.best_store_url)}" target="_blank" rel="noopener">Köp hos ${esc(det.best_retailer || "butik")} ↗</a>` : ""}
+          <a href="${esc(det.url)}" target="_blank" rel="noopener">Öppna på PrisGeek ↗</a>
+          <button class="btn-primary btn-sm" type="button" onclick="runAiAnalyzeProduct(${Number(publicId)}, ${targetPrice !== null ? Number(targetPrice) : "null"}, ${watchId !== null ? Number(watchId) : "null"})">Kör AI-analys</button>
+        </div>
+        ${renderReviewLinksHtml(det.external_review_links || [], reviews, false)}
+        <div id="detail-ai-box">${cachedVerdict}</div>
+        <div class="sim-panel">
+          <div style="font-weight:600; font-size:0.9rem;">Hitta liknande produkter (AI)</div>
+          <div class="subtext">Välj riktning och/eller beskriv vad som är viktigt jämfört med denna produkt:</div>
+          <div class="dir-chips" id="sim-dir-chips">
+            <button type="button" class="dir-chip${state.selectedSimDir === "cheaper" ? " active" : ""}" onclick="selectSimDir(this, 'cheaper')">💰 Billigare</button>
+            <button type="button" class="dir-chip${state.selectedSimDir === "same_tier" ? " active" : ""}" onclick="selectSimDir(this, 'same_tier')">⚖️ Bättre värde</button>
+            <button type="button" class="dir-chip${state.selectedSimDir === "upgrade" ? " active" : ""}" onclick="selectSimDir(this, 'upgrade')">🚀 Steget upp</button>
+            <button type="button" class="dir-chip${state.selectedSimDir === "quality" ? " active" : ""}" onclick="selectSimDir(this, 'quality')">🔇 Tystare / Kvalitet</button>
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+            <input id="sim-custom-prompt" type="text" style="flex:1; min-width:210px;" placeholder="t.ex. A2-klassat för Jetson, max 280mm, vit färg..." />
+            <input id="sim-max-price" type="number" step="1" min="0" style="width:125px;" placeholder="Maxpris (kr)" />
+            <button id="sim-search-btn" class="btn-primary btn-sm" type="button" onclick="runSimilarProducts(${Number(publicId)})">Hitta liknande</button>
+          </div>
+          <div id="detail-similar-box" style="margin-top:10px;"></div>
+        </div>
+        <div style="margin-bottom:14px;">${chartSvg}</div>
+        <h4 style="margin:10px 0 6px;">Butikserbjudanden (${offers.length})</h4>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Butik</th><th>Pris</th><th>Frakt</th><th>Totalt</th><th>Status</th></tr></thead>
+            <tbody>
+              ${offers.map(o => `
+                <tr>
+                  <td>${renderStoreLink(o.retailer_name, o.store_url)}</td>
+                  <td><strong>${fmtKr(o.price)}</strong></td>
+                  <td>${fmtKr(o.shipping)}</td>
+                  <td>${fmtKr(o.total_price)}</td>
+                  <td>${o.in_stock ? `<span class="badge badge-green">I lager</span>` : `<span class="badge badge-red">Slut</span>`}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
         </div>`;
+
+      const promptEl = document.getElementById("sim-custom-prompt");
+      if (promptEl) promptEl.value = snap.customPrompt || "";
+      const maxEl = document.getElementById("sim-max-price");
+      if (maxEl) maxEl.value = snap.maxPrice || "";
+      if (snap.similarRes) {
+        document.getElementById("detail-similar-box").innerHTML = renderSimilarSuggestionsHtml(snap.similarRes);
+      }
+    }
+
+    function goBackDetailModal() {
+      const prev = state.detailHistory.pop();
+      if (!prev) return;
+      renderDetailModalFromSnapshot(prev);
     }
 
     async function runSimilarProducts(publicId) {
@@ -1014,68 +1187,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function openProductDetailModal(publicId, targetPrice = null, watchId = null, autoAi = false) {
+    async function openProductDetailModal(publicId, targetPrice = null, watchId = null, autoAi = false, pushHistory = false) {
+      if (pushHistory && state.currentDetail) {
+        const prevSnap = captureCurrentDetailSnapshot();
+        if (prevSnap) state.detailHistory.push(prevSnap);
+      } else if (!pushHistory) {
+        state.detailHistory = [];
+      }
       const modal = document.getElementById("detail-modal");
       const body = document.getElementById("detail-body");
+      const backBtn = document.getElementById("detail-back-btn");
+      if (backBtn) {
+        backBtn.style.display = state.detailHistory.length ? "inline-block" : "none";
+      }
       document.getElementById("detail-title").textContent = "Hämtar historik & butiker...";
       body.innerHTML = `<div class="empty-msg">Laddar produktdata...</div>`;
-      modal.showModal();
+      if (!modal.open) modal.showModal();
       try {
         const det = await apiFetch(`/api/product/${Number(publicId)}`);
-        document.getElementById("detail-title").textContent = det.name;
-        const chartSvg = renderHistoryChart(det.history_series || [], targetPrice);
-        const offers = det.offers || [];
-        const reviews = det.extra_context?.reviews || [];
-        const w = watchId ? (state.watches?.product_watches || []).find(x => Number(x.id) === Number(watchId)) : null;
-        const cachedVerdict = w?.ai_verdict?.verdict_badge ? renderAiVerdictHtml(w.ai_verdict) : "";
-        state.selectedSimDir = "same_tier";
-        state.similarSuggestions = [];
-
-        body.innerHTML = `
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; font-size:0.86rem;">
-            <span>Nuvarande: <strong>${fmtKr(det.lowest_price)}</strong></span>
-            <span>30d-lägsta: <strong>${fmtKr(det.lowest_30d_price)}</strong></span>
-            <span>Lägsta någonsin: <strong>${fmtKr(det.lowest_all_time_price)}</strong></span>
-            <span class="badge badge-muted">${esc(det.deal_assessment)}</span>
-            ${det.best_store_url ? `<a class="badge badge-green" style="text-decoration:none;" href="${esc(det.best_store_url)}" target="_blank" rel="noopener">Köp hos ${esc(det.best_retailer || "butik")} ↗</a>` : ""}
-            <a href="${esc(det.url)}" target="_blank" rel="noopener">Öppna på PrisGeek ↗</a>
-            <button class="btn-primary btn-sm" type="button" onclick="runAiAnalyzeProduct(${Number(publicId)}, ${targetPrice !== null ? Number(targetPrice) : "null"}, ${watchId !== null ? Number(watchId) : "null"})">Kör AI-analys</button>
-          </div>
-          ${renderReviewLinksHtml(det.external_review_links || [], reviews, false)}
-          <div id="detail-ai-box">${cachedVerdict}</div>
-          <div class="sim-panel">
-            <div style="font-weight:600; font-size:0.9rem;">Hitta liknande produkter (AI)</div>
-            <div class="subtext">Välj riktning och/eller beskriv vad som är viktigt jämfört med denna produkt:</div>
-            <div class="dir-chips" id="sim-dir-chips">
-              <button type="button" class="dir-chip" onclick="selectSimDir(this, 'cheaper')">💰 Billigare</button>
-              <button type="button" class="dir-chip active" onclick="selectSimDir(this, 'same_tier')">⚖️ Bättre värde</button>
-              <button type="button" class="dir-chip" onclick="selectSimDir(this, 'upgrade')">🚀 Steget upp</button>
-              <button type="button" class="dir-chip" onclick="selectSimDir(this, 'quality')">🔇 Tystare / Kvalitet</button>
-            </div>
-            <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
-              <input id="sim-custom-prompt" type="text" style="flex:1; min-width:210px;" placeholder="t.ex. A2-klassat för Jetson, max 280mm, vit färg..." />
-              <input id="sim-max-price" type="number" step="1" min="0" style="width:125px;" placeholder="Maxpris (kr)" />
-              <button id="sim-search-btn" class="btn-primary btn-sm" type="button" onclick="runSimilarProducts(${Number(publicId)})">Hitta liknande</button>
-            </div>
-            <div id="detail-similar-box" style="margin-top:10px;"></div>
-          </div>
-          <div style="margin-bottom:14px;">${chartSvg}</div>
-          <h4 style="margin:10px 0 6px;">Butikserbjudanden (${offers.length})</h4>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Butik</th><th>Pris</th><th>Frakt</th><th>Totalt</th><th>Status</th></tr></thead>
-              <tbody>
-                ${offers.map(o => `
-                  <tr>
-                    <td>${renderStoreLink(o.retailer_name, o.store_url)}</td>
-                    <td><strong>${fmtKr(o.price)}</strong></td>
-                    <td>${fmtKr(o.shipping)}</td>
-                    <td>${fmtKr(o.total_price)}</td>
-                    <td>${o.in_stock ? `<span class="badge badge-green">I lager</span>` : `<span class="badge badge-red">Slut</span>`}</td>
-                  </tr>`).join("")}
-              </tbody>
-            </table>
-          </div>`;
+        const snap = {
+          publicId: Number(publicId),
+          targetPrice,
+          watchId,
+          det,
+          similarRes: null,
+          selectedSimDir: "same_tier",
+          customPrompt: "",
+          maxPrice: "",
+        };
+        renderDetailModalFromSnapshot(snap);
         if (autoAi) {
           runAiAnalyzeProduct(publicId, targetPrice, watchId);
         }

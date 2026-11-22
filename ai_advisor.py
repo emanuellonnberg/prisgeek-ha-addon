@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
 import re
+import statistics
 from typing import Any
 
 import httpx
@@ -354,18 +356,100 @@ def find_cross_tier_alternatives() -> dict[str, Any]:
     return result
 
 
+def _compute_anchor_price(
+    details: dict[str, Any], direction: str
+) -> tuple[float | None, float | None]:
+    """Compute lower/upper anchor prices using normal 30d median when discounted."""
+    raw_cur = details.get("lowest_price")
+    if raw_cur is None:
+        return None, None
+    current = float(raw_cur)
+    if current <= 0:
+        return None, None
+
+    hist_prices = [
+        float(pt["price"])
+        for pt in (details.get("history_series") or [])[-30:]
+        if isinstance(pt, dict) and pt.get("price") is not None and float(pt["price"]) > 0
+    ]
+    normal: float | None = statistics.median(hist_prices) if len(hist_prices) >= 3 else None
+    if normal is None:
+        in_stock_prices = [
+            float(o["price"])
+            for o in (details.get("offers") or [])
+            if o.get("in_stock") and o.get("price") is not None and float(o["price"]) > 0
+        ]
+        if len(in_stock_prices) >= 2:
+            normal = in_stock_prices[1]
+
+    if normal is not None:
+        normal = min(float(normal), current * 1.6)
+    else:
+        normal = current
+
+    if direction == "cheaper":
+        return current, current
+    return current, max(current, round(normal, 2))
+
+
+def _normalize_dedup_key(name: str, brand: str | None = None) -> str:
+    """Normalize brand + product title into a compact key to collapse near-duplicate SKUs."""
+    raw = str(name or "").lower()
+    raw = re.sub(r"\([^)]*\)", " ", raw)
+    brand_clean = str(brand or "").strip().lower()
+    if brand_clean and brand_clean not in raw:
+        raw = f"{brand_clean} {raw}"
+    tokens = re.findall(r"[a-z0-9åäö]+", raw)
+    return " ".join(tokens[:10])
+
+
+def _fmt_spec_val(val: Any) -> str:
+    if isinstance(val, bool):
+        return "Ja" if val else "Nej"
+    if isinstance(val, list):
+        return ", ".join(str(x) for x in val[:4])
+    return str(val).strip()
+
+
+def _compute_spec_diffs(
+    source_specs: Any, cand_specs: Any, limit: int = 4
+) -> list[dict[str, str]]:
+    """Return top differing key/value pairs between source and candidate specs dicts."""
+    if not isinstance(source_specs, dict) or not isinstance(cand_specs, dict):
+        return []
+    diffs: list[dict[str, str]] = []
+    for key, src_raw in source_specs.items():
+        if key not in cand_specs:
+            continue
+        cand_raw = cand_specs[key]
+        if src_raw is None or cand_raw is None:
+            continue
+        src_str = _fmt_spec_val(src_raw)
+        cand_str = _fmt_spec_val(cand_raw)
+        if not src_str or not cand_str or src_str.lower() == cand_str.lower():
+            continue
+        if len(src_str) > 48 or len(cand_str) > 48:
+            continue
+        diffs.append({"key": str(key), "source": src_str, "candidate": cand_str})
+        if len(diffs) >= limit:
+            break
+    return diffs
+
+
 def _plan_similar_search_queries(
     source_info: dict[str, Any],
     direction_label: str,
     guidance: str,
     custom_prompt: str,
-) -> list[str]:
-    """Ask HA AI for 3-5 concise PrisGeek search queries targeting competing models."""
+) -> tuple[list[str], str]:
+    """Ask HA AI for 3-5 short search queries (2-3 words) and a persistent interest query."""
     instructions = (
         "Du hjälper användaren hitta liknande eller konkurrerande produkter i en svensk prisdatabas (PrisGeek).\n"
-        "Utifrån källprodukten och användarens önskade riktning, ta fram 3 till 5 korta söktermer "
-        "(2–4 ord per sökning, bara produktnamn/serie/nyckelspec – inga priser eller butiksnamn) som hittar relevanta konkurrenter eller rätt uppgraderingar.\n"
-        'Svara ENDAST med giltig JSON: {"queries": ["sökterm 1", "sökterm 2", "sökterm 3"]}\n\n'
+        "Utifrån källprodukten och riktningen, ta fram:\n"
+        "1. 'queries': 3 till 5 KORTA söktermer (strikt 2–3 ord per sökning, bara märke + modellserie eller typ + kapacitet/watt – "
+        "UNDVIK detalj-suffix som 'A2', 'V30', 'UHS-I', 'ATX 3.1', 'PCIE5', 'Helmodulär', 'GDDR7', priser eller butiksnamn eftersom sökningen kräver exakt ordmatchning i produkttiteln).\n"
+        "2. 'interest_query': 1 bred men träffsäker sökterm (2–3 ord) som passar för en löpande intressebevakning i samma riktning.\n"
+        'Svara ENDAST med giltig JSON: {"queries": ["märke serie", "konkurrent 850w"], "interest_query": "bred sökterm"}\n\n'
         f"Källprodukt: {json.dumps(source_info, ensure_ascii=False)}\n"
         f"Riktning: {direction_label} ({guidance})\n"
         f"Extra önskemål från användaren: {custom_prompt or 'Inga extra önskemål.'}"
@@ -373,16 +457,88 @@ def _plan_similar_search_queries(
     try:
         raw_reply = _call_ha_ai_task("PrisGeek Liknande Sökplan", instructions)
         parsed = _extract_json(raw_reply)
-        if isinstance(parsed, dict) and isinstance(parsed.get("queries"), list):
-            queries = [str(q).strip() for q in parsed["queries"] if str(q).strip()]
-            return list(dict.fromkeys(queries))[:5]
+        if isinstance(parsed, dict):
+            raw_queries = parsed.get("queries")
+            queries = (
+                [str(q).strip() for q in raw_queries if str(q).strip()]
+                if isinstance(raw_queries, list)
+                else []
+            )
+            interest_q = str(parsed.get("interest_query") or "").strip()
+            return list(dict.fromkeys(queries))[:5], interest_q
     except Exception as exc:
         logger.debug("Stage 1 similar query planning skipped: %s", exc)
-    return []
+    return [], ""
+
+
+def _search_with_token_fallback(
+    query: str,
+    *,
+    max_p: float | None,
+    in_stock_only: bool,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run search_products on its own HTTP client with progressive tail-token drop on 0 hits."""
+    client = PrisGeekClient()
+    try:
+        effective = query.strip()
+        hits = client.search_products(
+            effective,
+            max_price=max_p,
+            in_stock_only=in_stock_only,
+            exclude_refurbished=True,
+            limit=12,
+        )
+        tokens = effective.split()
+        if not hits and len(tokens) >= 3:
+            effective = " ".join(tokens[:-1])
+            hits = client.search_products(
+                effective,
+                max_price=max_p,
+                in_stock_only=in_stock_only,
+                exclude_refurbished=True,
+                limit=12,
+            )
+        if not hits and len(tokens) >= 4:
+            effective = " ".join(tokens[:2])
+            hits = client.search_products(
+                effective,
+                max_price=max_p,
+                in_stock_only=in_stock_only,
+                exclude_refurbished=True,
+                limit=12,
+            )
+        return effective, hits
+    finally:
+        client.close()
+
+
+def _fetch_peers_worker(
+    category_id: str | None,
+    *,
+    subcategory: str | None,
+    min_p: float | None,
+    max_p: float | None,
+    target_pid: int,
+    in_stock_only: bool,
+) -> list[dict[str, Any]]:
+    """Query category peers using an isolated HTTP client for thread safety."""
+    client = PrisGeekClient()
+    try:
+        return client.find_category_peers(
+            category_id,
+            subcategory=subcategory,
+            min_price=min_p,
+            max_price=max_p,
+            exclude_public_id=target_pid,
+            in_stock_only=in_stock_only,
+            exclude_refurbished=True,
+            limit=25,
+        )
+    finally:
+        client.close()
 
 
 def _collect_similar_candidates(
-    client: PrisGeekClient,
     details: dict[str, Any],
     queries: list[str],
     *,
@@ -390,10 +546,11 @@ def _collect_similar_candidates(
     max_p: float | None,
     explicit_max_price: float | None,
     in_stock_only: bool,
-) -> list[dict[str, Any]]:
-    """Gather deduplicated live PrisGeek candidates from AI search queries and category peers."""
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Gather deduplicated live PrisGeek candidates concurrently from AI queries and category peers."""
     target_pid = int(details["public_id"])
-    by_pid: dict[int, dict[str, Any]] = {}
+    raw_pool: dict[int, dict[str, Any]] = {}
+    effective_queries: list[str] = []
 
     def _add(items: list[dict[str, Any]], *, from_search: bool) -> None:
         for item in items:
@@ -403,60 +560,68 @@ def _collect_similar_candidates(
             pid = int(raw_pid)
             if pid == target_pid:
                 continue
-            existing = by_pid.get(pid)
+            existing = raw_pool.get(pid)
             if existing is None:
                 entry = dict(item)
                 entry["_from_search"] = from_search
-                by_pid[pid] = entry
+                raw_pool[pid] = entry
             elif from_search and not existing.get("_from_search"):
                 existing["_from_search"] = True
 
-    for q in queries[:5]:
-        try:
-            hits = client.search_products(
+    cleaned_queries = [q.strip() for q in queries[:5] if q.strip()]
+    max_workers = max(2, min(6, len(cleaned_queries) + 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        query_futures = {
+            executor.submit(
+                _search_with_token_fallback,
                 q,
-                max_price=max_p,
+                max_p=max_p,
                 in_stock_only=in_stock_only,
-                exclude_refurbished=True,
-                limit=12,
-            )
-            _add(hits, from_search=True)
-        except Exception as exc:
-            logger.debug("Similar candidate search failed for %r: %s", q, exc)
-
-    try:
-        peers = client.find_category_peers(
+            ): idx
+            for idx, q in enumerate(cleaned_queries)
+        }
+        peer_future = executor.submit(
+            _fetch_peers_worker,
             details.get("category_id"),
             subcategory=details.get("subcategory"),
-            min_price=min_p,
-            max_price=max_p,
-            exclude_public_id=target_pid,
+            min_p=min_p,
+            max_p=max_p,
+            target_pid=target_pid,
             in_stock_only=in_stock_only,
-            exclude_refurbished=True,
-            limit=25,
         )
-        _add(peers, from_search=False)
-    except Exception as exc:
-        logger.debug("Category peer lookup failed for %s: %s", target_pid, exc)
 
-    if len(by_pid) < 4:
+        ordered_eff: dict[int, str] = {}
+        for fut in as_completed(query_futures):
+            idx = query_futures[fut]
+            try:
+                eff_q, hits = fut.result()
+                ordered_eff[idx] = eff_q
+                _add(hits, from_search=True)
+            except Exception as exc:
+                logger.debug("Similar candidate search failed (%s): %s", idx, exc)
+        effective_queries = [ordered_eff[i] for i in sorted(ordered_eff)]
+
         try:
-            broad_peers = client.find_category_peers(
+            _add(peer_future.result(), from_search=False)
+        except Exception as exc:
+            logger.debug("Category peer lookup failed for %s: %s", target_pid, exc)
+
+    if len(raw_pool) < 4:
+        try:
+            broad_peers = _fetch_peers_worker(
                 details.get("category_id"),
                 subcategory=details.get("subcategory"),
-                min_price=None,
-                max_price=explicit_max_price,
-                exclude_public_id=target_pid,
+                min_p=None,
+                max_p=explicit_max_price,
+                target_pid=target_pid,
                 in_stock_only=in_stock_only,
-                exclude_refurbished=True,
-                limit=25,
             )
             _add(broad_peers, from_search=False)
         except Exception as exc:
             logger.debug("Broad category fallback failed for %s: %s", target_pid, exc)
 
-    ranked = sorted(
-        by_pid.values(),
+    pre_sorted = sorted(
+        raw_pool.values(),
         key=lambda item: (
             not bool(item.get("_from_search")),
             not bool(item.get("in_stock")),
@@ -464,7 +629,19 @@ def _collect_similar_candidates(
             float(item.get("lowest_price") or 0.0),
         ),
     )
-    return ranked[:28]
+
+    # Collapse near-identical duplicate SKU listings while keeping the highest-ranked entry.
+    deduped: list[dict[str, Any]] = []
+    seen_norm_keys: set[str] = set()
+    for item in pre_sorted:
+        dkey = _normalize_dedup_key(str(item.get("name") or ""), item.get("brand"))
+        if dkey and dkey in seen_norm_keys:
+            continue
+        if dkey:
+            seen_norm_keys.add(dkey)
+        deduped.append(item)
+
+    return deduped[:28], effective_queries
 
 
 def suggest_similar_products(
@@ -485,39 +662,41 @@ def suggest_similar_products(
     client = PrisGeekClient()
     try:
         details = client.get_product_details(public_id_or_url)
-        source_price = details.get("lowest_price")
-        min_p: float | None = round(float(source_price) * min_mult, 2) if source_price else None
-        max_p: float | None = round(float(source_price) * max_mult, 2) if source_price else None
-        if max_price is not None:
-            cap = float(max_price)
-            max_p = min(max_p, cap) if max_p is not None else cap
-            if min_p is not None and min_p > cap:
-                min_p = max(0.0, cap * 0.5)
-
-        source_info = {
-            "public_id": details["public_id"],
-            "name": details["name"],
-            "brand": details.get("brand"),
-            "category": details.get("category"),
-            "subcategory": details.get("subcategory"),
-            "lowest_price_sek": source_price,
-            "specs": details.get("specs"),
-        }
-
-        queries = _plan_similar_search_queries(
-            source_info, direction_label, guidance, clean_custom
-        )
-        candidates = _collect_similar_candidates(
-            client,
-            details,
-            queries,
-            min_p=min_p,
-            max_p=max_p,
-            explicit_max_price=float(max_price) if max_price is not None else None,
-            in_stock_only=in_stock_only,
-        )
     finally:
         client.close()
+
+    source_price = details.get("lowest_price")
+    anchor_low, anchor_high = _compute_anchor_price(details, dir_key)
+    min_p: float | None = round(anchor_low * min_mult, 2) if anchor_low else None
+    max_p: float | None = round(anchor_high * max_mult, 2) if anchor_high else None
+    explicit_cap = float(max_price) if max_price is not None else None
+    if explicit_cap is not None:
+        max_p = min(max_p, explicit_cap) if max_p is not None else explicit_cap
+        if min_p is not None and min_p > explicit_cap:
+            min_p = max(0.0, explicit_cap * 0.5)
+
+    source_info = {
+        "public_id": details["public_id"],
+        "name": details["name"],
+        "brand": details.get("brand"),
+        "category": details.get("category"),
+        "subcategory": details.get("subcategory"),
+        "lowest_price_sek": source_price,
+        "anchor_normal_price_sek": anchor_high,
+        "specs": details.get("specs"),
+    }
+
+    planned_queries, interest_query = _plan_similar_search_queries(
+        source_info, direction_label, guidance, clean_custom
+    )
+    candidates, effective_queries = _collect_similar_candidates(
+        details,
+        planned_queries,
+        min_p=min_p,
+        max_p=max_p,
+        explicit_max_price=explicit_cap,
+        in_stock_only=in_stock_only,
+    )
 
     source_summary = {
         "public_id": details["public_id"],
@@ -529,6 +708,37 @@ def suggest_similar_products(
         "url": details.get("url"),
     }
 
+    suggested_query = (
+        interest_query
+        or (effective_queries[0] if effective_queries else "")
+        or details.get("clean_model_query")
+        or details["name"]
+    )
+    suggested_target = (
+        int(round(explicit_cap))
+        if explicit_cap is not None
+        else (
+            int(
+                round(
+                    float(source_price)
+                    * (0.9 if dir_key == "cheaper" else 1.2 if dir_key in ("upgrade", "quality") else 1.05)
+                )
+            )
+            if source_price
+            else int(round(float(max_p or 1500)))
+        )
+    )
+    cat_label = details.get("subcategory") or details.get("category") or "Liknande"
+    suggested_interest_watch = {
+        "name": f"{cat_label}: {direction_label}"[:80],
+        "search_query": suggested_query[:80],
+        "target_price": max(50, suggested_target),
+        "ai_requirements": (
+            clean_custom
+            or f"{direction_label} — {guidance} (jämfört med {details['name']})"
+        ),
+    }
+
     if not candidates:
         return {
             "source_product": source_summary,
@@ -536,9 +746,10 @@ def suggest_similar_products(
             "direction_label": direction_label,
             "custom_prompt": clean_custom,
             "summary": "Inga tillgängliga alternativ hittades i PrisGeeks katalog inom valt prisintervall.",
-            "search_queries_used": queries,
+            "search_queries_used": effective_queries,
             "candidate_pool_size": 0,
             "suggestions": [],
+            "suggested_interest_watch": suggested_interest_watch,
             "generated_at": utc_now_iso(),
         }
 
@@ -561,9 +772,11 @@ def suggest_similar_products(
     instructions = (
         "Du är en svensk hårdvarurådgivare. Välj ut upp till 5 av de BÄSTA liknande produkterna/alternativen "
         "från kandidatlistan utifrån användarens riktning och extra önskemål.\n"
-        "REGLER:\n"
+        "STRIKTA REGLER:\n"
         "- Välj ENDAST public_id som finns exakt i kandidatlistan (hitta aldrig på egna produkter eller priser).\n"
-        "- Rensa bort irrelevanta tillbehör, kablar eller fel produktkategori.\n"
+        "- Byt ALDRIG inkompatibel formfaktor eller standard (t.ex. fullstort SD-kort när originalet är microSD, DDR4 när originalet är DDR5, SFX när originalet är ATX, eller AM4 när originalet är AM5).\n"
+        "- Vid riktning 'Steget upp' eller 'Tystare / högre kvalitet': undvik att sänka kärnkapacitet/wattal (t.ex. 1TB -> 512GB eller 850W -> 750W) om det finns likvärdiga eller bättre alternativ med minst samma kapacitet/effekt i listan.\n"
+        "- Välj inte dubbletter av nästan exakt samma modell; rensa bort tillbehör/kablar.\n"
         "- Svara ENDAST med giltig JSON i exakt detta format:\n"
         '{"summary": "1-2 korta meningar på svenska som sammanfattar rekommendationen", '
         '"suggestions": [{"public_id": 123, "match_score": 9, "tag": "Bäst för kraven", '
@@ -615,6 +828,7 @@ def suggest_similar_products(
                 "in_stock": cand.get("in_stock"),
                 "offer_count": cand.get("offer_count"),
                 "external_review_links": cand.get("external_review_links") or [],
+                "spec_diffs": _compute_spec_diffs(details.get("specs"), cand.get("specs")),
                 "price_diff_kr": diff_kr,
                 "price_diff_pct": diff_pct,
                 "match_score": int(raw_sug.get("match_score") or 8),
@@ -632,9 +846,10 @@ def suggest_similar_products(
         "direction_label": direction_label,
         "custom_prompt": clean_custom,
         "summary": str(parsed.get("summary") or ""),
-        "search_queries_used": queries,
+        "search_queries_used": effective_queries,
         "candidate_pool_size": len(candidates),
         "suggestions": suggestions,
+        "suggested_interest_watch": suggested_interest_watch,
         "generated_at": utc_now_iso(),
     }
 

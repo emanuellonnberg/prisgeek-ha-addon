@@ -56,6 +56,23 @@ REFURB_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+B2B_RETAILER_RE = re.compile(r"(\(b2b\)|\bb2b\b|\bföretag\b|\batea\b)", re.IGNORECASE)
+
+
+def _load_runtime_store_settings() -> dict[str, Any]:
+    """Read store filter & total-price settings safely without hard dependency if DB is unavailable."""
+    try:
+        from db import load_store_settings
+
+        return load_store_settings()
+    except Exception:
+        return {
+            "exclude_b2b": False,
+            "blocked_retailers": [],
+            "use_total_price_with_shipping": False,
+            "show_ex_vat": False,
+        }
+
 PRODUCT_SELECT = (
     "id,public_id,slug,name,brand,model,image_url,mpn,specs,release_date,"
     "category_id,subcategory,categories(slug,name),"
@@ -158,8 +175,12 @@ def summarize_offers(
     *,
     in_stock_only: bool = False,
     exclude_refurbished: bool = True,
+    exclude_b2b: bool = False,
+    blocked_retailers: list[str] | None = None,
+    sort_by_total: bool = False,
 ) -> dict[str, Any]:
     """Filter, normalize, and sort store offers to determine best price and retailer."""
+    blocked_lower = [b.strip().lower() for b in (blocked_retailers or []) if b and b.strip()]
     normalized_offers: list[dict[str, Any]] = []
     for offer in offers or []:
         raw_price = offer.get("price")
@@ -191,6 +212,12 @@ def summarize_offers(
         retailer_name = retailer_info.get("name") or "Okänd butik"
         retailer_slug = retailer_info.get("slug") or ""
 
+        r_lower = str(retailer_name).lower()
+        if exclude_b2b and B2B_RETAILER_RE.search(r_lower):
+            continue
+        if blocked_lower and any(b in r_lower for b in blocked_lower):
+            continue
+
         normalized_offers.append(
             {
                 "price": round(price, 2),
@@ -207,8 +234,11 @@ def summarize_offers(
             }
         )
 
-    # Sort in-stock offers before out-of-stock offers, then lowest price first.
-    normalized_offers.sort(key=lambda o: (not o["in_stock"], o["price"], o["total_price"]))
+    # Sort in-stock offers before out-of-stock offers, ordered by total or base price.
+    if sort_by_total:
+        normalized_offers.sort(key=lambda o: (not o["in_stock"], o["total_price"], o["price"]))
+    else:
+        normalized_offers.sort(key=lambda o: (not o["in_stock"], o["price"], o["total_price"]))
 
     in_stock_offers = [o for o in normalized_offers if o["in_stock"]]
     active_pool = in_stock_offers if in_stock_offers else normalized_offers
@@ -663,10 +693,14 @@ class PrisGeekClient:
         if exclude_refurbished and REFURB_NAME_RE.search(name):
             return None
 
+        store_cfg = _load_runtime_store_settings()
         summary = summarize_offers(
             row.get("offers"),
             in_stock_only=in_stock_only,
             exclude_refurbished=exclude_refurbished,
+            exclude_b2b=bool(store_cfg.get("exclude_b2b", False)),
+            blocked_retailers=store_cfg.get("blocked_retailers") or [],
+            sort_by_total=bool(store_cfg.get("use_total_price_with_shipping", False)),
         )
         lowest_price = summary["lowest_price"]
         if lowest_price is None:
@@ -790,9 +824,19 @@ class PrisGeekClient:
                         continue
                 results.append(hit)
 
-        results.sort(
-            key=lambda item: (not item["in_stock"], item["lowest_price"], item["lowest_total_price"] or 0.0)
-        )
+        store_cfg = _load_runtime_store_settings()
+        if store_cfg.get("use_total_price_with_shipping"):
+            results.sort(
+                key=lambda item: (
+                    not item["in_stock"],
+                    item["lowest_total_price"] if item["lowest_total_price"] is not None else item["lowest_price"],
+                    item["lowest_price"],
+                )
+            )
+        else:
+            results.sort(
+                key=lambda item: (not item["in_stock"], item["lowest_price"], item["lowest_total_price"] or 0.0)
+            )
         return results[:limit]
 
     def find_category_peers(
@@ -1000,10 +1044,14 @@ class PrisGeekClient:
         row = rows[0]
         pid = int(row["public_id"])
         product_url = self._format_product_url(pid, row.get("slug"))
+        store_cfg = _load_runtime_store_settings()
         summary = summarize_offers(
             row.get("offers"),
             in_stock_only=in_stock_only,
             exclude_refurbished=exclude_refurbished,
+            exclude_b2b=bool(store_cfg.get("exclude_b2b", False)),
+            blocked_retailers=store_cfg.get("blocked_retailers") or [],
+            sort_by_total=bool(store_cfg.get("use_total_price_with_shipping", False)),
         )
         history = self._extract_ssr_history_metrics(product_url, row.get("id"))
 

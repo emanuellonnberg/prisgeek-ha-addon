@@ -26,7 +26,9 @@ from db import (
     get_setting,
     init_db,
     list_all_watches,
+    load_store_settings,
     remove_watch,
+    save_store_settings,
     update_product_watch_config,
     update_query_watch_config,
 )
@@ -665,6 +667,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <div class="card">
         <div class="deal-meta" style="margin-bottom: 10px;">
+          <h2 style="margin: 0;">Butiks- &amp; Prisinställningar</h2>
+          <span class="badge badge-muted" id="ss-status-badge">Standard</span>
+        </div>
+        <form id="store-settings-form">
+          <div class="form-row">
+            <label class="checkbox-label">
+              <input type="checkbox" id="ss-exclude-b2b" /> Exkludera B2B-butiker (t.ex. Dustin B2B)
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" id="ss-use-total" /> Räkna målpris &amp; bästa träff inklusive frakt
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" id="ss-show-ex-vat" /> Visa även pris exkl. moms (25% för företag)
+            </label>
+          </div>
+          <div class="form-inline" style="margin-bottom: 4px;">
+            <div class="form-row" style="flex:1; min-width:220px; margin-bottom:0;">
+              <label for="ss-blocked">Blockerade butiker (komma-separerade, valfritt)</label>
+              <input id="ss-blocked" placeholder="t.ex. CDON, Computersalg" />
+            </div>
+            <button type="submit" class="btn-primary btn-sm">Spara butiksinställningar</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="deal-meta" style="margin-bottom: 10px;">
           <h2 style="margin: 0;">Home Assistant Lovelace YAML</h2>
           <button class="btn-secondary btn-sm" id="copy-yaml-btn">Kopiera YAML</button>
         </div>
@@ -849,6 +878,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       lastSimilarResult: null,
       categories: [],
       quietHours: null,
+      storeSettings: null,
     };
     let pendingModalPid = null;
     let editingProductId = null;
@@ -866,6 +896,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function fmtKr(val) {
       if (val === null || val === undefined || Number.isNaN(Number(val))) return "–";
       return `${Math.round(Number(val)).toLocaleString("sv-SE")} kr`;
+    }
+
+    function fmtPriceCell(val, strong = true) {
+      if (val === null || val === undefined || Number.isNaN(Number(val))) return "–";
+      const main = strong ? `<strong>${fmtKr(val)}</strong>` : fmtKr(val);
+      if (state.storeSettings?.show_ex_vat) {
+        const exVat = Math.round(Number(val) / 1.25).toLocaleString("sv-SE");
+        return `${main}<div class="subtext">${exVat} kr exkl. moms</div>`;
+      }
+      return main;
+    }
+
+    function fmtPriceInline(val, strong = true) {
+      if (val === null || val === undefined || Number.isNaN(Number(val))) return "–";
+      const main = strong ? `<strong>${fmtKr(val)}</strong>` : fmtKr(val);
+      if (state.storeSettings?.show_ex_vat) {
+        const exVat = Math.round(Number(val) / 1.25).toLocaleString("sv-SE");
+        return `${main} <span class="subtext">(${exVat} kr exkl. moms)</span>`;
+      }
+      return main;
     }
 
     function fmtDate(iso) {
@@ -1120,9 +1170,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const body = document.getElementById("detail-body");
       body.innerHTML = `
         <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; font-size:0.86rem;">
-          <span>Nuvarande: <strong>${fmtKr(det.lowest_price)}</strong></span>
-          <span>30d-lägsta: <strong>${fmtKr(det.lowest_30d_price)}</strong></span>
-          <span>Lägsta någonsin: <strong>${fmtKr(det.lowest_all_time_price)}</strong></span>
+          <span>Nuvarande: ${fmtPriceInline(det.lowest_price)}</span>
+          <span>30d-lägsta: ${fmtPriceInline(det.lowest_30d_price)}</span>
+          <span>Lägsta någonsin: ${fmtPriceInline(det.lowest_all_time_price)}</span>
           <span class="badge badge-muted">${esc(det.deal_assessment)}</span>
           ${det.best_store_url ? `<a class="badge badge-green" style="text-decoration:none;" href="${esc(det.best_store_url)}" target="_blank" rel="noopener">Köp hos ${esc(det.best_retailer || "butik")} ↗</a>` : ""}
           <a href="${esc(det.url)}" target="_blank" rel="noopener">Öppna på PrisGeek ↗</a>
@@ -1155,9 +1205,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               ${offers.map(o => `
                 <tr>
                   <td>${renderStoreLink(o.retailer_name, o.store_url)}</td>
-                  <td><strong>${fmtKr(o.price)}</strong></td>
+                  <td>${fmtPriceCell(o.price)}</td>
                   <td>${fmtKr(o.shipping)}</td>
-                  <td>${fmtKr(o.total_price)}</td>
+                  <td>${fmtPriceCell(o.total_price, false)}</td>
                   <td>${o.in_stock ? `<span class="badge badge-green">I lager</span>` : `<span class="badge badge-red">Slut</span>`}</td>
                 </tr>`).join("")}
             </tbody>
@@ -1312,7 +1362,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 return `
                 <tr>
                   <td><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.name)}</a></td>
-                  <td><strong>${fmtKr(m.lowest_price)}</strong><div class="subtext">${fmtKr(m.lowest_total_price)} inkl.</div></td>
+                  <td>${fmtPriceCell(m.lowest_price)}<div class="subtext">${fmtKr(m.lowest_total_price)} inkl.</div></td>
                   <td>${renderStoreLink(m.best_retailer, m.store_url || m.best_store_url)}</td>
                   <td>${aiCell}</td>
                   <td class="actions-cell">
@@ -1467,6 +1517,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             : (qh.active ? `Aktiv nu (${qh.local_time})` : `Vilande (${qh.local_time})`);
         }
       }
+      const ss = state.storeSettings;
+      if (ss) {
+        document.getElementById("ss-exclude-b2b").checked = Boolean(ss.exclude_b2b);
+        document.getElementById("ss-use-total").checked = Boolean(ss.use_total_price_with_shipping);
+        document.getElementById("ss-show-ex-vat").checked = Boolean(ss.show_ex_vat);
+        document.getElementById("ss-blocked").value = (ss.blocked_retailers || []).join(", ");
+        const ssBadge = document.getElementById("ss-status-badge");
+        if (ssBadge) {
+          const flags = [];
+          flags.push(ss.exclude_b2b ? "Utan B2B" : "Inkl. B2B");
+          if (ss.use_total_price_with_shipping) flags.push("Inkl. frakt");
+          if (ss.show_ex_vat) flags.push("Visa exkl. moms");
+          if ((ss.blocked_retailers || []).length) flags.push(`${ss.blocked_retailers.length} blockerad(e)`);
+          ssBadge.textContent = flags.join(" · ");
+        }
+      }
       document.getElementById("ha-yaml-box").textContent = buildLovelaceYaml(pw, qw);
 
       const profileEl = document.getElementById("ai-profile-input");
@@ -1518,10 +1584,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                       ${w.notes ? `<div class="subtext">${esc(w.notes)}</div>` : ""}
                       ${w.ai_requirements ? `<div class="subtext">AI: ${esc(w.ai_requirements)}</div>` : ""}
                     </td>
-                    <td><strong>${fmtKr(cur)}</strong></td>
+                    <td>${fmtPriceCell(cur)}</td>
                     <td>${renderStoreLink(w.last_retailer, w.last_store_url)}</td>
                     <td>
-                      <strong>${fmtKr(target)}</strong>
+                      ${fmtPriceCell(target)}
                       ${rules.length ? `<div class="subtext">${esc(rules.join(" · "))}</div>` : ""}
                     </td>
                     <td>${fmtKr(w.lowest_30d_price)} / ${fmtKr(w.lowest_all_time_price)}</td>
@@ -1565,7 +1631,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     : `<span class="badge badge-amber">+${Math.round(diff)} kr över</span>`;
                   matchHtml = `
                     <div><a href="${esc(q.best_match_url)}" target="_blank" rel="noopener">${esc(q.best_match_name)}</a></div>
-                    <div class="subtext"><strong>${fmtKr(q.best_match_price)}</strong> @ ${renderStoreLink(q.best_match_retailer, q.best_match_store_url)} · ${diffBadge} <span class="badge badge-muted">${Number(q.match_count || 0)} träffar</span></div>`;
+                    <div class="subtext">${fmtPriceInline(q.best_match_price)} @ ${renderStoreLink(q.best_match_retailer, q.best_match_store_url)} · ${diffBadge} <span class="badge badge-muted">${Number(q.match_count || 0)} träffar</span></div>`;
                 } else if (q.last_checked_at) {
                   matchHtml = `<span class="badge badge-red">0 träffar</span>`;
                 }
@@ -1644,6 +1710,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state.history = data.history;
         state.config = data.config;
         state.quietHours = data.quiet_hours;
+        state.storeSettings = data.store_settings;
         state.aiProfile = data.ai_profile;
         state.lastDigest = data.last_digest;
         state.lastAlternatives = data.last_alternatives;
@@ -2037,6 +2104,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     });
 
+    document.getElementById("store-settings-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        const res = await apiFetch("/api/settings/store", {
+          method: "PUT",
+          body: JSON.stringify({
+            exclude_b2b: document.getElementById("ss-exclude-b2b").checked,
+            use_total_price_with_shipping: document.getElementById("ss-use-total").checked,
+            show_ex_vat: document.getElementById("ss-show-ex-vat").checked,
+            blocked_retailers: document.getElementById("ss-blocked").value.split(",").map(s => s.trim()).filter(Boolean),
+          }),
+        });
+        state.storeSettings = res;
+        renderState();
+        showToast("Butiks- & prisinställningar sparade!");
+      } catch (err) {
+        showToast(`Kunde inte spara butiksinställningar: ${err.message}`, true);
+      }
+    });
+
     document.getElementById("ai-digest-btn").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
       btn.disabled = true;
@@ -2107,8 +2194,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     ${renderReviewLinksHtml(item.external_review_links || [], [], true)}
                   </td>
                   <td>${esc(item.brand || "–")}</td>
-                  <td><strong>${fmtKr(item.lowest_price)}</strong></td>
-                  <td>${fmtKr(item.lowest_total_price)}</td>
+                  <td>${fmtPriceCell(item.lowest_price)}</td>
+                  <td>${fmtPriceCell(item.lowest_total_price, false)}</td>
                   <td>${renderStoreLink(item.best_retailer, item.best_store_url)}</td>
                   <td>${item.in_stock ? `<span class="badge badge-green">I lager</span>` : `<span class="badge badge-red">Slut</span>`}</td>
                   <td class="actions-cell">
@@ -2179,6 +2266,7 @@ async def api_state(_request: Request) -> JSONResponse:
     history = await run_in_threadpool(get_recent_history, None, 50)
     config = await run_in_threadpool(load_notifier_config)
     quiet_hours = await run_in_threadpool(get_quiet_hours_status)
+    store_settings = await run_in_threadpool(load_store_settings)
     ai_profile = await run_in_threadpool(get_setting, "ai_profile", DEFAULT_AI_PROFILE)
     last_digest = await run_in_threadpool(get_setting, "last_digest", None)
     last_alternatives = await run_in_threadpool(get_setting, "last_alternatives", None)
@@ -2188,6 +2276,7 @@ async def api_state(_request: Request) -> JSONResponse:
             "history": history,
             "config": config,
             "quiet_hours": quiet_hours,
+            "store_settings": store_settings,
             "ai_profile": ai_profile,
             "last_digest": last_digest,
             "last_alternatives": last_alternatives,
@@ -2223,6 +2312,21 @@ async def api_save_quiet_hours(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
         logger.exception("Saving quiet hours failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def api_save_store_settings(request: Request) -> JSONResponse:
+    """Validate and persist store-filtering and pricing preferences."""
+    try:
+        body = await request.json()
+        saved = await run_in_threadpool(
+            save_store_settings, body if isinstance(body, dict) else {}
+        )
+        return JSONResponse(saved)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("Saving store settings failed")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -2631,6 +2735,7 @@ app = Starlette(
         Route("/api/state", api_state, methods=["GET"]),
         Route("/api/categories", api_categories, methods=["GET"]),
         Route("/api/settings/quiet-hours", api_save_quiet_hours, methods=["PUT"]),
+        Route("/api/settings/store", api_save_store_settings, methods=["PUT"]),
         Route("/api/watches/product", api_add_product_watch, methods=["POST"]),
         Route("/api/watches/interest", api_add_interest_watch, methods=["POST"]),
         Route("/api/watches/{watch_type}/{watch_id:int}", api_update_watch, methods=["PUT"]),

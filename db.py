@@ -790,3 +790,67 @@ def set_setting(key: str, value: Any) -> None:
             (key, encoded, utc_now_iso()),
         )
         conn.commit()
+
+
+DEFAULT_STORE_SETTINGS: dict[str, Any] = {
+    "exclude_b2b": False,
+    "blocked_retailers": [],
+    "use_total_price_with_shipping": False,
+    "show_ex_vat": False,
+}
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _normalize_blocked_retailers(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, list):
+        items = [str(x) for x in raw]
+    else:
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = item.strip()
+        low = text.lower()
+        if text and low not in seen:
+            seen.add(low)
+            cleaned.append(text)
+    return cleaned
+
+
+def load_store_settings() -> dict[str, Any]:
+    """Load store-filtering and pricing preferences merged with defaults."""
+    saved = get_setting("store_settings", {})
+    raw = saved if isinstance(saved, dict) else {}
+    return {
+        "exclude_b2b": _to_bool(raw.get("exclude_b2b"), DEFAULT_STORE_SETTINGS["exclude_b2b"]),
+        "blocked_retailers": _normalize_blocked_retailers(raw.get("blocked_retailers")),
+        "use_total_price_with_shipping": _to_bool(
+            raw.get("use_total_price_with_shipping"),
+            DEFAULT_STORE_SETTINGS["use_total_price_with_shipping"],
+        ),
+        "show_ex_vat": _to_bool(raw.get("show_ex_vat"), DEFAULT_STORE_SETTINGS["show_ex_vat"]),
+    }
+
+
+def save_store_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist store-filtering and pricing preferences."""
+    normalized = {
+        "exclude_b2b": _to_bool(cfg.get("exclude_b2b"), DEFAULT_STORE_SETTINGS["exclude_b2b"]),
+        "blocked_retailers": _normalize_blocked_retailers(cfg.get("blocked_retailers")),
+        "use_total_price_with_shipping": _to_bool(
+            cfg.get("use_total_price_with_shipping"),
+            DEFAULT_STORE_SETTINGS["use_total_price_with_shipping"],
+        ),
+        "show_ex_vat": _to_bool(cfg.get("show_ex_vat"), DEFAULT_STORE_SETTINGS["show_ex_vat"]),
+    }
+    set_setting("store_settings", normalized)
+    return normalized

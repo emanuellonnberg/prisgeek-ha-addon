@@ -13,6 +13,7 @@ from db import (
     get_recent_history,
     init_db,
     list_all_watches,
+    load_store_settings,
     log_alert,
     record_price_observation,
     should_send_alert,
@@ -78,6 +79,8 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
 
     qh_status = get_quiet_hours_status()
     defer_now = bool(send_webhooks and qh_status["active"] and qh_status["mode"] == "defer")
+    store_cfg = load_store_settings()
+    use_total = bool(store_cfg.get("use_total_price_with_shipping", False))
 
     client = PrisGeekClient()
     try:
@@ -120,21 +123,27 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     }
                 )
 
+            eval_price = (
+                total_price
+                if (use_total and total_price is not None)
+                else current_price
+            )
+
             alerted_price: float | None = None
             trigger_reason: str | None = None
-            if current_price is not None:
-                if current_price <= float(watch["target_price"]):
-                    trigger_reason = "Under målpris"
+            if eval_price is not None:
+                if eval_price <= float(watch["target_price"]):
+                    trigger_reason = "Under målpris inkl. frakt" if use_total else "Under målpris"
                 elif (
                     bool(watch.get("alert_on_all_time_low", 1))
                     and details.get("lowest_all_time_price")
-                    and current_price <= float(details["lowest_all_time_price"])
+                    and eval_price <= float(details["lowest_all_time_price"])
                 ):
                     trigger_reason = "Rekordlågt (Lägsta pris någonsin)"
                 elif (
                     float(watch.get("alert_below_30d_pct") or 0) > 0
                     and details.get("lowest_30d_price")
-                    and current_price
+                    and eval_price
                     <= float(details["lowest_30d_price"])
                     * (1.0 - float(watch["alert_below_30d_pct"]) / 100.0)
                 ):
@@ -143,9 +152,9 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     )
 
             if (
-                current_price is not None
+                eval_price is not None
                 and trigger_reason is not None
-                and should_send_alert("product", watch["id"], pid, current_price)
+                and should_send_alert("product", watch["id"], pid, eval_price)
             ):
                 ai_note = ""
                 if watch.get("ai_requirements") or send_webhooks:
@@ -172,9 +181,9 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                         logger.debug("AI product vetting skipped for %s: %s", pid, exc)
 
             if (
-                current_price is not None
+                eval_price is not None
                 and trigger_reason is not None
-                and should_send_alert("product", watch["id"], pid, current_price)
+                and should_send_alert("product", watch["id"], pid, eval_price)
             ):
                 full_reason = f"{trigger_reason} — {ai_note}" if ai_note else trigger_reason
                 alert_payload = {
@@ -200,7 +209,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                             "watch_id": watch["id"],
                             "public_id": pid,
                             "product_name": details["name"],
-                            "price": current_price,
+                            "price": eval_price,
                             "retailer": retailer,
                             "reason": "quiet_hours",
                         }
@@ -212,10 +221,10 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                         watch_id=watch["id"],
                         public_id=pid,
                         product_name=details["name"],
-                        price=current_price,
+                        price=eval_price,
                         retailer=retailer,
                     )
-                    alerted_price = current_price
+                    alerted_price = eval_price
                     summary["triggered_alerts"].append({**alert_payload, "notify": notify_res})
 
             update_product_watch_state(
@@ -258,7 +267,13 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                 if item.get("lowest_price") is not None
                 and matches_keyword_rules(item, must_kw, excl_kw)
             ]
-            matched_items.sort(key=lambda item: float(item["lowest_price"]))
+            matched_items.sort(
+                key=lambda item: float(
+                    item["lowest_total_price"]
+                    if (use_total and item.get("lowest_total_price") is not None)
+                    else item["lowest_price"]
+                )
+            )
 
             top_preview = [
                 {
@@ -313,7 +328,13 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
             for item in matched_items:
                 pid = int(item["public_id"])
                 price = float(item["lowest_price"])
-                if price > float(qwatch["target_price"]):
+                total_p = item.get("lowest_total_price")
+                eval_price = (
+                    float(total_p)
+                    if (use_total and total_p is not None)
+                    else price
+                )
+                if eval_price > float(qwatch["target_price"]):
                     continue
 
                 v = vetted_map.get(pid)
@@ -329,7 +350,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     public_id=pid,
                     product_name=item["name"],
                     price=price,
-                    total_price=item.get("lowest_total_price"),
+                    total_price=total_p,
                     retailer=item.get("best_retailer"),
                     in_stock=bool(item.get("in_stock")),
                 )
@@ -341,6 +362,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                         "public_id": pid,
                         "product_name": item["name"],
                         "price": price,
+                        "total_price": total_p,
                         "retailer": item.get("best_retailer"),
                         "url": item["url"],
                     }
@@ -354,10 +376,11 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     "query",
                     qwatch["id"],
                     pid,
-                    price,
+                    eval_price,
                     best_only=alert_best_only,
                 ):
                     ai_suffix = f" — AI ({v.get('score')}/10): {v.get('note')}" if v and v.get("note") else ""
+                    basis_note = " (inkl. frakt)" if use_total else ""
                     alert_payload = {
                         "watch_type": "query",
                         "watch_id": qwatch["id"],
@@ -365,10 +388,10 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                         "public_id": pid,
                         "product_name": item["name"],
                         "price": price,
-                        "total_price": item.get("lowest_total_price"),
+                        "total_price": total_p,
                         "target_price": qwatch["target_price"],
                         "retailer": item.get("best_retailer"),
-                        "trigger_reason": f"Intressebevakning under maxpris{ai_suffix}",
+                        "trigger_reason": f"Intressebevakning under maxpris{basis_note}{ai_suffix}",
                         "url": item["url"],
                         "store_url": item.get("best_store_url"),
                     }
@@ -386,7 +409,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                             watch_id=qwatch["id"],
                             public_id=pid,
                             product_name=item["name"],
-                            price=price,
+                            price=eval_price,
                             retailer=item.get("best_retailer"),
                         )
                         summary["triggered_alerts"].append({**alert_payload, "notify": notify_res})

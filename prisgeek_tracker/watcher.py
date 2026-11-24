@@ -19,7 +19,7 @@ from db import (
     update_product_watch_state,
     update_query_watch_results,
 )
-from notifier import push_ha_sensors, send_price_alert
+from notifier import get_quiet_hours_status, push_ha_sensors, send_price_alert
 from prisgeek_client import PrisGeekClient, _token_variants
 
 logger = logging.getLogger(__name__)
@@ -71,9 +71,13 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
         "checked_query_watches": 0,
         "price_changes": [],
         "triggered_alerts": [],
+        "deferred_alerts": [],
         "matches_found": [],
         "errors": [],
     }
+
+    qh_status = get_quiet_hours_status()
+    defer_now = bool(send_webhooks and qh_status["active"] and qh_status["mode"] == "defer")
 
     client = PrisGeekClient()
     try:
@@ -189,17 +193,30 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     "url": details["url"],
                     "store_url": details.get("best_store_url"),
                 }
-                notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)
-                log_alert(
-                    watch_type="product",
-                    watch_id=watch["id"],
-                    public_id=pid,
-                    product_name=details["name"],
-                    price=current_price,
-                    retailer=retailer,
-                )
-                alerted_price = current_price
-                summary["triggered_alerts"].append({**alert_payload, "notify": notify_res})
+                if defer_now:
+                    summary["deferred_alerts"].append(
+                        {
+                            "watch_type": "product",
+                            "watch_id": watch["id"],
+                            "public_id": pid,
+                            "product_name": details["name"],
+                            "price": current_price,
+                            "retailer": retailer,
+                            "reason": "quiet_hours",
+                        }
+                    )
+                else:
+                    notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)
+                    log_alert(
+                        watch_type="product",
+                        watch_id=watch["id"],
+                        public_id=pid,
+                        product_name=details["name"],
+                        price=current_price,
+                        retailer=retailer,
+                    )
+                    alerted_price = current_price
+                    summary["triggered_alerts"].append({**alert_payload, "notify": notify_res})
 
             update_product_watch_state(
                 watch_id=watch["id"],
@@ -216,9 +233,11 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
         for qwatch in query_watches:
             summary["checked_query_watches"] += 1
             include_outlet = bool(qwatch.get("include_outlet", 0))
+            alert_best_only = bool(qwatch.get("alert_best_only", 1))
             try:
                 candidates = client.search_products(
                     qwatch["search_query"],
+                    category=(qwatch.get("category") or None),
                     max_price=None,
                     in_stock_only=bool(qwatch["in_stock_only"]),
                     exclude_refurbished=not include_outlet,
@@ -290,6 +309,7 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     in_stock=bool(best.get("in_stock")),
                 )
 
+            best_alert_evaluated = False
             for item in matched_items:
                 pid = int(item["public_id"])
                 price = float(item["lowest_price"])
@@ -326,7 +346,17 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                     }
                 )
 
-                if should_send_alert("query", qwatch["id"], pid, price):
+                if alert_best_only and best_alert_evaluated:
+                    continue
+                best_alert_evaluated = True
+
+                if should_send_alert(
+                    "query",
+                    qwatch["id"],
+                    pid,
+                    price,
+                    best_only=alert_best_only,
+                ):
                     ai_suffix = f" — AI ({v.get('score')}/10): {v.get('note')}" if v and v.get("note") else ""
                     alert_payload = {
                         "watch_type": "query",
@@ -342,16 +372,24 @@ def run_check_cycle(*, send_webhooks: bool = True) -> dict[str, Any]:
                         "url": item["url"],
                         "store_url": item.get("best_store_url"),
                     }
-                    notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)
-                    log_alert(
-                        watch_type="query",
-                        watch_id=qwatch["id"],
-                        public_id=pid,
-                        product_name=item["name"],
-                        price=price,
-                        retailer=item.get("best_retailer"),
-                    )
-                    summary["triggered_alerts"].append({**alert_payload, "notify": notify_res})
+                    if defer_now:
+                        summary["deferred_alerts"].append(
+                            {
+                                **alert_payload,
+                                "reason": "quiet_hours",
+                            }
+                        )
+                    else:
+                        notify_res = send_price_alert(alert_payload, dry_run=not send_webhooks)
+                        log_alert(
+                            watch_type="query",
+                            watch_id=qwatch["id"],
+                            public_id=pid,
+                            product_name=item["name"],
+                            price=price,
+                            retailer=item.get("best_retailer"),
+                        )
+                        summary["triggered_alerts"].append({**alert_payload, "notify": notify_res})
 
             time.sleep(0.5)
     finally:

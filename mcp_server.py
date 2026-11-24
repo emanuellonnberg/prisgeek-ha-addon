@@ -60,16 +60,18 @@ def _remote_request(
 @mcp.tool()
 def search_products(
     query: str,
+    category: str | None = None,
     max_price: float | None = None,
     in_stock_only: bool = False,
     exclude_refurbished: bool = True,
     limit: int = 15,
 ) -> list[dict[str, Any]]:
-    """Search PrisGeek for products matching a query and return current Swedish store offers."""
+    """Search PrisGeek for products matching a query (optionally filtered by category slug/name) and return current Swedish store offers."""
     client = PrisGeekClient()
     try:
         return client.search_products(
             query,
+            category=category,
             max_price=max_price,
             in_stock_only=in_stock_only,
             exclude_refurbished=exclude_refurbished,
@@ -269,10 +271,12 @@ def add_interest_watch(
     name: str,
     search_query: str,
     target_price: float,
+    category: str = "",
     must_include_keywords: list[str] | None = None,
     exclude_keywords: list[str] | None = None,
     in_stock_only: bool = True,
     include_outlet: bool = False,
+    alert_best_only: bool = True,
     ai_requirements: str = "",
 ) -> dict[str, Any]:
     """Create a keyword/interest discovery watch and immediately populate best & top-5 matching products."""
@@ -284,10 +288,12 @@ def add_interest_watch(
                 "name": name,
                 "search_query": search_query,
                 "target_price": target_price,
+                "category": category,
                 "must_include_keywords": must_include_keywords or [],
                 "exclude_keywords": exclude_keywords or [],
                 "in_stock_only": in_stock_only,
                 "include_outlet": include_outlet,
+                "alert_best_only": alert_best_only,
                 "ai_requirements": ai_requirements,
             },
         )
@@ -296,11 +302,13 @@ def add_interest_watch(
         name=name,
         search_query=search_query,
         target_price=target_price,
+        category=category,
         must_include_keywords=must_include_keywords,
         exclude_keywords=exclude_keywords,
         in_stock_only=in_stock_only,
         exclude_refurbished=not include_outlet,
         include_outlet=include_outlet,
+        alert_best_only=alert_best_only,
         ai_requirements=ai_requirements,
     )
 
@@ -308,6 +316,7 @@ def add_interest_watch(
     try:
         candidates = client.search_products(
             search_query,
+            category=category or None,
             in_stock_only=in_stock_only,
             exclude_refurbished=not include_outlet,
             limit=60,

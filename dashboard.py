@@ -40,7 +40,13 @@ from mcp_server import (
     optimize_shopping_basket,
     search_products,
 )
-from notifier import load_notifier_config, send_price_alert
+from notifier import (
+    get_quiet_hours_status,
+    load_notifier_config,
+    save_quiet_hours_config,
+    send_price_alert,
+)
+from prisgeek_client import PrisGeekClient
 from watcher import run_check_cycle
 
 logger = logging.getLogger(__name__)
@@ -479,6 +485,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <input id="iw-target" type="number" step="1" min="1" required placeholder="1600" />
             </div>
           </div>
+          <div class="form-row">
+            <label for="iw-category">Kategori (valfritt — hindrar felträffar t.ex. laptop vs GPU)</label>
+            <select id="iw-category">
+              <option value="">Alla kategorier</option>
+            </select>
+          </div>
           <div class="form-grid-2">
             <div class="form-row">
               <label for="iw-keywords">Kräv nyckelord (komma)</label>
@@ -494,6 +506,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <input id="iw-ai-req" placeholder="t.ex. Endast A2/V30 med bra kylning, inga budgetfällor" />
           </div>
           <div class="form-row">
+            <label class="checkbox-label">
+              <input type="checkbox" id="iw-best-only" checked /> Larma bara vid nytt lägsta pris (undvik multi-SKU-spam)
+            </label>
             <label class="checkbox-label">
               <input type="checkbox" id="iw-outlet" /> Inkludera fyndvaror / outlet
             </label>
@@ -619,6 +634,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <div class="card">
         <div class="deal-meta" style="margin-bottom: 10px;">
+          <h2 style="margin: 0;">Notisinställningar &amp; Tyst tid (Quiet Hours)</h2>
+          <span class="badge badge-muted" id="qh-status-badge">Laddar...</span>
+        </div>
+        <form id="quiet-hours-form">
+          <div class="form-inline" style="margin-bottom: 8px;">
+            <label class="checkbox-label">
+              <input type="checkbox" id="qh-enabled" checked /> Aktivera tyst tid
+            </label>
+            <div class="form-row" style="margin-bottom: 0;">
+              <label for="qh-start">Från (lokal tid)</label>
+              <input id="qh-start" type="time" value="22:00" required />
+            </div>
+            <div class="form-row" style="margin-bottom: 0;">
+              <label for="qh-end">Till (lokal tid)</label>
+              <input id="qh-end" type="time" value="07:30" required />
+            </div>
+            <div class="form-row" style="margin-bottom: 0;">
+              <label for="qh-mode">Under tyst tid</label>
+              <select id="qh-mode">
+                <option value="defer">Skjut upp till morgonen</option>
+                <option value="silent">Tyst notis på iPhone (inget ljud)</option>
+              </select>
+            </div>
+            <button type="submit" class="btn-primary btn-sm">Spara tyst tid</button>
+          </div>
+          <div class="subtext">Prishistorik och Home Assistant-sensorer uppdateras alltid dygnet runt även under tyst tid.</div>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="deal-meta" style="margin-bottom: 10px;">
           <h2 style="margin: 0;">Home Assistant Lovelace YAML</h2>
           <button class="btn-secondary btn-sm" id="copy-yaml-btn">Kopiera YAML</button>
         </div>
@@ -731,6 +777,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
       <div class="form-row">
+        <label for="ei-category">Kategori</label>
+        <select id="ei-category">
+          <option value="">Alla kategorier</option>
+        </select>
+      </div>
+      <div class="form-row">
         <label for="ei-must">Krävda nyckelord (komma)</label>
         <input id="ei-must" />
       </div>
@@ -743,6 +795,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <input id="ei-ai-req" placeholder="t.ex. Endast A2/V30, undvik budgetmodeller" />
       </div>
       <div class="form-row">
+        <label class="checkbox-label"><input type="checkbox" id="ei-best-only" /> Larma bara vid nytt lägsta pris (undvik multi-SKU-spam)</label>
         <label class="checkbox-label"><input type="checkbox" id="ei-stock" /> Endast i lager</label>
         <label class="checkbox-label"><input type="checkbox" id="ei-outlet" /> Inkludera fyndvaror / outlet</label>
       </div>
@@ -794,6 +847,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       detailHistory: [],
       currentDetail: null,
       lastSimilarResult: null,
+      categories: [],
+      quietHours: null,
     };
     let pendingModalPid = null;
     let editingProductId = null;
@@ -1293,9 +1348,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("ei-name").value = q.name;
       document.getElementById("ei-query").value = q.search_query;
       document.getElementById("ei-target").value = String(q.target_price);
+      document.getElementById("ei-category").value = q.category || "";
       document.getElementById("ei-must").value = (q.must_include_keywords || []).join(", ");
       document.getElementById("ei-excl").value = (q.exclude_keywords || []).join(", ");
       document.getElementById("ei-ai-req").value = q.ai_requirements || "";
+      document.getElementById("ei-best-only").checked = q.alert_best_only !== 0;
       document.getElementById("ei-stock").checked = Boolean(q.in_stock_only);
       document.getElementById("ei-outlet").checked = Boolean(q.include_outlet);
       document.getElementById("edit-interest-modal").showModal();
@@ -1392,7 +1449,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const cfg = state.config || {};
       const hookStatus = cfg.use_ha_webhook === false ? "Direkt via HA Supervisor" : (cfg.ha_webhook_url || "Aktiverad");
       const notifySvc = cfg.notify_service || "auto (mobile_app)";
-      document.getElementById("webhook-badge").textContent = `Notis: ${notifySvc} | ${hookStatus}`;
+      const qh = state.quietHours;
+      const qhSummary = qh && qh.enabled
+        ? ` | Tyst tid: ${qh.start}–${qh.end}${qh.active ? " (aktiv nu)" : ""}`
+        : "";
+      document.getElementById("webhook-badge").textContent = `Notis: ${notifySvc} | ${hookStatus}${qhSummary}`;
+      if (qh) {
+        document.getElementById("qh-enabled").checked = Boolean(qh.enabled);
+        document.getElementById("qh-start").value = qh.start || "22:00";
+        document.getElementById("qh-end").value = qh.end || "07:30";
+        document.getElementById("qh-mode").value = qh.mode || "defer";
+        const qhBadge = document.getElementById("qh-status-badge");
+        if (qhBadge) {
+          qhBadge.className = `badge ${qh.active ? "badge-amber" : "badge-muted"}`;
+          qhBadge.textContent = !qh.enabled
+            ? "Avstängd"
+            : (qh.active ? `Aktiv nu (${qh.local_time})` : `Vilande (${qh.local_time})`);
+        }
+      }
       document.getElementById("ha-yaml-box").textContent = buildLovelaceYaml(pw, qw);
 
       const profileEl = document.getElementById("ai-profile-input");
@@ -1495,11 +1569,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 } else if (q.last_checked_at) {
                   matchHtml = `<span class="badge badge-red">0 träffar</span>`;
                 }
+                const catObj = (state.categories || []).find(c => c.slug === q.category || c.name === q.category || c.id === q.category);
+                const catLabel = q.category ? (catObj ? catObj.name : q.category) : "";
+                const modeLabel = q.alert_best_only === 0 ? "Alla modeller" : "Bara bästa pris";
                 return `
                   <tr>
                     <td>
                       <strong>${esc(q.name)}</strong>
-                      <div class="subtext">Sök: ${esc(q.search_query)}${q.include_outlet ? " · Inkl. outlet" : ""}</div>
+                      <div class="subtext">
+                        Sök: ${esc(q.search_query)}
+                        ${catLabel ? ` · <span class="badge badge-purple">${esc(catLabel)}</span>` : ""}
+                        · <span class="badge badge-muted">${esc(modeLabel)}</span>
+                        ${q.include_outlet ? " · Inkl. outlet" : ""}
+                      </div>
                       ${q.ai_requirements ? `<div class="subtext">AI: ${esc(q.ai_requirements)}</div>` : ""}
                     </td>
                     <td>
@@ -1532,12 +1614,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         : `<table><thead><tr><th>Tid</th><th>Produkt</th><th>Pris</th><th>Inkl. frakt</th><th>Butik</th></tr></thead><tbody>${hist.map(h => `<tr><td>${fmtDate(h.recorded_at)}</td><td>${esc(h.product_name)}</td><td><strong>${fmtKr(h.price)}</strong></td><td>${fmtKr(h.total_price)}</td><td>${esc(h.retailer || "–")}</td></tr>`).join("")}</tbody></table>`;
     }
 
+    function populateCategorySelect(selectId) {
+      const sel = document.getElementById(selectId);
+      if (!sel) return;
+      const cur = sel.value;
+      const opts = ['<option value="">Alla kategorier</option>'].concat(
+        (state.categories || []).map(c => `<option value="${esc(c.slug)}">${esc(c.name)}</option>`)
+      );
+      sel.innerHTML = opts.join("");
+      if (cur) sel.value = cur;
+    }
+
+    async function loadCategories() {
+      try {
+        const data = await apiFetch("/api/categories");
+        state.categories = data.categories || [];
+        populateCategorySelect("iw-category");
+        populateCategorySelect("ei-category");
+        if (state.watches) renderState();
+      } catch (err) {
+        console.warn("Could not load PrisGeek categories:", err);
+      }
+    }
+
     async function loadState() {
       try {
         const data = await apiFetch("/api/state");
         state.watches = data.watches;
         state.history = data.history;
         state.config = data.config;
+        state.quietHours = data.quiet_hours;
         state.aiProfile = data.ai_profile;
         state.lastDigest = data.last_digest;
         state.lastAlternatives = data.last_alternatives;
@@ -1844,11 +1950,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             name: document.getElementById("iw-name").value.trim(),
             search_query: document.getElementById("iw-query").value.trim(),
             target_price: Number(document.getElementById("iw-target").value),
+            category: document.getElementById("iw-category").value,
             must_include_keywords: keywords,
             exclude_keywords: excludeKeywords,
             ai_requirements: document.getElementById("iw-ai-req").value.trim(),
             in_stock_only: true,
             include_outlet: document.getElementById("iw-outlet").checked,
+            alert_best_only: document.getElementById("iw-best-only").checked,
           }),
         });
         showToast(`Lade till "${res.watch.name}" (${res.current_matches.length} träffar nu)`);
@@ -1892,11 +2000,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             name: document.getElementById("ei-name").value.trim(),
             search_query: document.getElementById("ei-query").value.trim(),
             target_price: Number(document.getElementById("ei-target").value),
+            category: document.getElementById("ei-category").value,
             must_include_keywords: document.getElementById("ei-must").value.split(",").map(s => s.trim()).filter(Boolean),
             exclude_keywords: document.getElementById("ei-excl").value.split(",").map(s => s.trim()).filter(Boolean),
             ai_requirements: document.getElementById("ei-ai-req").value.trim(),
             in_stock_only: document.getElementById("ei-stock").checked,
             include_outlet: document.getElementById("ei-outlet").checked,
+            alert_best_only: document.getElementById("ei-best-only").checked,
           }),
         });
         document.getElementById("edit-interest-modal").close();
@@ -1904,6 +2014,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         await loadState();
       } catch (err) {
         showToast(`Fel: ${err.message}`, true);
+      }
+    });
+
+    document.getElementById("quiet-hours-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        const res = await apiFetch("/api/settings/quiet-hours", {
+          method: "PUT",
+          body: JSON.stringify({
+            enabled: document.getElementById("qh-enabled").checked,
+            start: document.getElementById("qh-start").value,
+            end: document.getElementById("qh-end").value,
+            mode: document.getElementById("qh-mode").value,
+          }),
+        });
+        state.quietHours = res;
+        renderState();
+        showToast("Tyst tid sparad!");
+      } catch (err) {
+        showToast(`Kunde inte spara tyst tid: ${err.message}`, true);
       }
     });
 
@@ -2022,6 +2152,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     });
 
+    loadCategories();
     loadState();
   </script>
 </body>
@@ -2047,6 +2178,7 @@ async def api_state(_request: Request) -> JSONResponse:
     watches = await run_in_threadpool(list_all_watches, True)
     history = await run_in_threadpool(get_recent_history, None, 50)
     config = await run_in_threadpool(load_notifier_config)
+    quiet_hours = await run_in_threadpool(get_quiet_hours_status)
     ai_profile = await run_in_threadpool(get_setting, "ai_profile", DEFAULT_AI_PROFILE)
     last_digest = await run_in_threadpool(get_setting, "last_digest", None)
     last_alternatives = await run_in_threadpool(get_setting, "last_alternatives", None)
@@ -2055,11 +2187,43 @@ async def api_state(_request: Request) -> JSONResponse:
             "watches": watches,
             "history": history,
             "config": config,
+            "quiet_hours": quiet_hours,
             "ai_profile": ai_profile,
             "last_digest": last_digest,
             "last_alternatives": last_alternatives,
         }
     )
+
+
+async def api_categories(_request: Request) -> JSONResponse:
+    """Return PrisGeek product categories for watch/search dropdowns."""
+    def _fetch() -> list[dict[str, str]]:
+        client = PrisGeekClient()
+        try:
+            return client.get_categories()
+        finally:
+            client.close()
+
+    try:
+        categories = await run_in_threadpool(_fetch)
+        return JSONResponse({"categories": categories})
+    except Exception as exc:
+        logger.exception("Categories lookup failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def api_save_quiet_hours(request: Request) -> JSONResponse:
+    """Validate and persist quiet-hours configuration."""
+    try:
+        body = await request.json()
+        await run_in_threadpool(save_quiet_hours_config, body if isinstance(body, dict) else {})
+        status = await run_in_threadpool(get_quiet_hours_status)
+        return JSONResponse(status)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("Saving quiet hours failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 async def api_add_product_watch(request: Request) -> JSONResponse:
@@ -2114,10 +2278,12 @@ async def api_add_interest_watch(request: Request) -> JSONResponse:
             name=name,
             search_query=search_query,
             target_price=target_price,
+            category=str(body.get("category") or ""),
             must_include_keywords=list(must_kw),
             exclude_keywords=list(excl_kw),
             in_stock_only=_parse_bool(body.get("in_stock_only"), True),
             include_outlet=_parse_bool(body.get("include_outlet"), False),
+            alert_best_only=_parse_bool(body.get("alert_best_only"), True),
             ai_requirements=str(body.get("ai_requirements") or ""),
         )
         return JSONResponse(result)
@@ -2152,10 +2318,12 @@ async def api_update_watch(request: Request) -> JSONResponse:
                 name=str(body["name"]),
                 search_query=str(body["search_query"]),
                 target_price=float(body["target_price"]),
+                category=str(body.get("category") or ""),
                 must_include_keywords=list(body.get("must_include_keywords") or []),
                 exclude_keywords=list(body.get("exclude_keywords") or []),
                 in_stock_only=_parse_bool(body.get("in_stock_only"), True),
                 include_outlet=_parse_bool(body.get("include_outlet"), False),
+                alert_best_only=_parse_bool(body.get("alert_best_only"), True),
                 ai_requirements=str(body.get("ai_requirements") or ""),
             )
             return JSONResponse({"watch": updated})
@@ -2206,7 +2374,12 @@ async def api_test_notify(_request: Request) -> JSONResponse:
         "url": "https://prisgeek.se/prisfall",
     }
     try:
-        res = await run_in_threadpool(send_price_alert, test_payload, dry_run=False)
+        res = await run_in_threadpool(
+            send_price_alert,
+            test_payload,
+            dry_run=False,
+            ignore_quiet_hours=True,
+        )
         return JSONResponse(res)
     except Exception as exc:
         logger.exception("Test notification failed")
@@ -2234,12 +2407,14 @@ async def api_search(request: Request) -> JSONResponse:
 
     max_price_raw = request.query_params.get("max_price")
     max_price = float(max_price_raw) if max_price_raw else None
+    category = str(request.query_params.get("category") or "").strip() or None
     in_stock_only = _parse_bool(request.query_params.get("in_stock_only"), True)
 
     try:
         results = await run_in_threadpool(
             search_products,
             query=query,
+            category=category,
             max_price=max_price,
             in_stock_only=in_stock_only,
             exclude_refurbished=True,
@@ -2454,6 +2629,8 @@ app = Starlette(
     routes=[
         Route("/", homepage, methods=["GET"]),
         Route("/api/state", api_state, methods=["GET"]),
+        Route("/api/categories", api_categories, methods=["GET"]),
+        Route("/api/settings/quiet-hours", api_save_quiet_hours, methods=["PUT"]),
         Route("/api/watches/product", api_add_product_watch, methods=["POST"]),
         Route("/api/watches/interest", api_add_interest_watch, methods=["POST"]),
         Route("/api/watches/{watch_type}/{watch_id:int}", api_update_watch, methods=["PUT"]),

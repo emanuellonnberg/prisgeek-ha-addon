@@ -137,6 +137,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "ALTER TABLE query_watches ADD COLUMN top_matches_json TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE query_watches ADD COLUMN ai_requirements TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE query_watches ADD COLUMN last_ai_summary_json TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE query_watches ADD COLUMN category TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE query_watches ADD COLUMN alert_best_only INTEGER NOT NULL DEFAULT 1",
     ]
     for stmt in alter_statements:
         try:
@@ -284,11 +286,13 @@ def add_query_watch(
     name: str,
     search_query: str,
     target_price: float,
+    category: str = "",
     must_include_keywords: list[str] | None = None,
     exclude_keywords: list[str] | None = None,
     in_stock_only: bool = True,
     exclude_refurbished: bool = True,
     include_outlet: bool = False,
+    alert_best_only: bool = True,
     ai_requirements: str = "",
 ) -> dict[str, Any]:
     """Create a new keyword/interest discovery watch rule and return the saved row."""
@@ -299,21 +303,23 @@ def add_query_watch(
         cursor = conn.execute(
             """
             INSERT INTO query_watches (
-                name, search_query, must_include_keywords, exclude_keywords,
+                name, search_query, category, must_include_keywords, exclude_keywords,
                 target_price, in_stock_only, exclude_refurbished, include_outlet,
-                ai_requirements, active
+                alert_best_only, ai_requirements, active
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 name.strip(),
                 search_query.strip(),
+                (category or "").strip(),
                 json.dumps(must_list, ensure_ascii=False),
                 json.dumps(excl_list, ensure_ascii=False),
                 float(target_price),
                 int(in_stock_only),
                 int(exclude_refurbished),
                 int(include_outlet),
+                int(alert_best_only),
                 ai_requirements.strip(),
             ),
         )
@@ -376,10 +382,12 @@ def update_query_watch_config(
     name: str,
     search_query: str,
     target_price: float,
+    category: str = "",
     must_include_keywords: list[str] | None = None,
     exclude_keywords: list[str] | None = None,
     in_stock_only: bool = True,
     include_outlet: bool = False,
+    alert_best_only: bool = True,
     ai_requirements: str = "",
 ) -> dict[str, Any]:
     """Update mutable settings on an existing interest/query watch and return the updated row."""
@@ -392,24 +400,28 @@ def update_query_watch_config(
             UPDATE query_watches
             SET name = ?,
                 search_query = ?,
+                category = ?,
                 must_include_keywords = ?,
                 exclude_keywords = ?,
                 target_price = ?,
                 in_stock_only = ?,
                 include_outlet = ?,
                 exclude_refurbished = ?,
+                alert_best_only = ?,
                 ai_requirements = ?
             WHERE id = ? AND active = 1
             """,
             (
                 name.strip(),
                 search_query.strip(),
+                (category or "").strip(),
                 json.dumps(must_list, ensure_ascii=False),
                 json.dumps(excl_list, ensure_ascii=False),
                 float(target_price),
                 int(in_stock_only),
                 int(include_outlet),
                 int(not include_outlet),
+                int(alert_best_only),
                 ai_requirements.strip(),
                 watch_id,
             ),
@@ -641,19 +653,34 @@ def update_query_watch_results(
 
 
 def should_send_alert(
-    watch_type: str, watch_id: int, public_id: int, current_price: float
+    watch_type: str,
+    watch_id: int,
+    public_id: int,
+    current_price: float,
+    *,
+    best_only: bool = False,
 ) -> bool:
-    """Return True if no prior alert exists for this watch+product, or price dropped lower."""
+    """Return True if no prior alert exists for this watch (or watch+product), or price dropped lower."""
     init_db()
     with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT MIN(price) AS min_alerted_price
-            FROM alert_log
-            WHERE watch_type = ? AND watch_id = ? AND public_id = ?
-            """,
-            (watch_type, watch_id, public_id),
-        ).fetchone()
+        if best_only:
+            row = conn.execute(
+                """
+                SELECT MIN(price) AS min_alerted_price
+                FROM alert_log
+                WHERE watch_type = ? AND watch_id = ?
+                """,
+                (watch_type, watch_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT MIN(price) AS min_alerted_price
+                FROM alert_log
+                WHERE watch_type = ? AND watch_id = ? AND public_id = ?
+                """,
+                (watch_type, watch_id, public_id),
+            ).fetchone()
     if row is None or row["min_alerted_price"] is None:
         return True
     return float(current_price) < float(row["min_alerted_price"])

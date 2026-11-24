@@ -14,6 +14,8 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+_CATEGORIES_CACHE: list[dict[str, str]] | None = None
+
 PRISGEEK_BASE = "https://prisgeek.se"
 DEFAULT_SUPABASE_URL = "https://xnzqsditjjzxeinbpilo.supabase.co"
 DEFAULT_SUPABASE_KEY = "sb_publishable_wu9XYY1fkqp-V-TnLxtg9g_ZyEOULtt"
@@ -606,6 +608,47 @@ class PrisGeekClient:
         clean_slug = (slug or "produkt").strip("/")
         return f"{PRISGEEK_BASE}/produkt/{public_id}/{clean_slug}"
 
+    def get_categories(self, *, force_refresh: bool = False) -> list[dict[str, str]]:
+        """Fetch and cache PrisGeek product categories (id, name, slug)."""
+        global _CATEGORIES_CACHE
+        if _CATEGORIES_CACHE is not None and not force_refresh:
+            return list(_CATEGORIES_CACHE)
+        rows = self._supabase_get(
+            "categories",
+            [("select", "id,name,slug"), ("order", "name.asc"), ("limit", "100")],
+        ) or []
+        parsed = [
+            {
+                "id": str(r.get("id") or ""),
+                "name": str(r.get("name") or ""),
+                "slug": str(r.get("slug") or ""),
+            }
+            for r in rows
+            if r.get("id") and r.get("name")
+        ]
+        if parsed:
+            _CATEGORIES_CACHE = parsed
+        return parsed
+
+    def resolve_category_id(self, category: str | None) -> str | None:
+        """Resolve a category slug, Swedish display name, or UUID to a Supabase category_id."""
+        cleaned = (category or "").strip().lower()
+        if not cleaned:
+            return None
+        try:
+            cats = self.get_categories()
+        except Exception as exc:
+            logger.debug("Category lookup failed: %s", exc)
+            return None
+        for cat in cats:
+            if cleaned in {
+                cat["id"].lower(),
+                cat["slug"].lower(),
+                cat["name"].lower(),
+            }:
+                return cat["id"]
+        return None
+
     def _format_search_hit(
         self,
         row: dict[str, Any],
@@ -671,6 +714,7 @@ class PrisGeekClient:
         self,
         query: str,
         *,
+        category: str | None = None,
         max_price: float | None = None,
         in_stock_only: bool = False,
         exclude_refurbished: bool = True,
@@ -681,6 +725,9 @@ class PrisGeekClient:
         if not tokens:
             return []
 
+        cat_filter = (category or "").strip()
+        cat_id = self.resolve_category_id(cat_filter) if cat_filter else None
+
         fetch_limit = max(limit * 5, 80)
         base_params: list[tuple[str, str]] = [
             ("select", PRODUCT_SELECT),
@@ -688,6 +735,8 @@ class PrisGeekClient:
             ("offers.price_flag", "is.null"),
             ("limit", str(fetch_limit)),
         ]
+        if cat_id:
+            base_params.append(("category_id", f"eq.{cat_id}"))
 
         clause_parts: list[str] = []
         for tok in tokens:
@@ -735,6 +784,10 @@ class PrisGeekClient:
                 max_price=max_price,
             )
             if hit is not None:
+                if cat_filter and not cat_id:
+                    hit_cat = str(hit.get("category") or "").lower()
+                    if cat_filter.lower() not in hit_cat:
+                        continue
                 results.append(hit)
 
         results.sort(

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, time as dt_time, timezone
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -15,6 +18,13 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 ADDON_OPTIONS_PATH = Path("/data/options.json")
 DEFAULT_HA_WEBHOOK_URL = "http://homeassistant.local:8123/api/webhook/black_friday_alert"
+DEFAULT_QUIET_HOURS: dict[str, Any] = {
+    "enabled": True,
+    "start": "22:00",
+    "end": "07:30",
+    "mode": "defer",
+    "timezone": "Europe/Stockholm",
+}
 
 
 def _parse_bool(value: Any, default: bool = True) -> bool:
@@ -128,6 +138,95 @@ def load_notifier_config() -> dict[str, Any]:
     }
 
 
+def _parse_hhmm(raw: Any, fallback: str) -> str:
+    """Validate and normalize an HH:MM string."""
+    text = str(raw or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    if not m:
+        return fallback
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return fallback
+    return f"{hour:02d}:{minute:02d}"
+
+
+def load_quiet_hours_config() -> dict[str, Any]:
+    """Load persisted quiet-hours configuration merged with defaults."""
+    from db import get_setting
+
+    saved = get_setting("quiet_hours", {})
+    raw = saved if isinstance(saved, dict) else {}
+    mode = str(raw.get("mode") or DEFAULT_QUIET_HOURS["mode"]).strip().lower()
+    if mode not in {"defer", "silent"}:
+        mode = DEFAULT_QUIET_HOURS["mode"]
+    tz_name = str(raw.get("timezone") or DEFAULT_QUIET_HOURS["timezone"]).strip() or "Europe/Stockholm"
+    return {
+        "enabled": _parse_bool(raw.get("enabled"), bool(DEFAULT_QUIET_HOURS["enabled"])),
+        "start": _parse_hhmm(raw.get("start"), DEFAULT_QUIET_HOURS["start"]),
+        "end": _parse_hhmm(raw.get("end"), DEFAULT_QUIET_HOURS["end"]),
+        "mode": mode,
+        "timezone": tz_name,
+    }
+
+
+def save_quiet_hours_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist quiet-hours settings."""
+    from db import set_setting
+
+    mode = str(cfg.get("mode") or DEFAULT_QUIET_HOURS["mode"]).strip().lower()
+    if mode not in {"defer", "silent"}:
+        raise ValueError("mode must be 'defer' or 'silent'")
+    tz_name = str(cfg.get("timezone") or DEFAULT_QUIET_HOURS["timezone"]).strip() or "Europe/Stockholm"
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        tz_name = DEFAULT_QUIET_HOURS["timezone"]
+    normalized = {
+        "enabled": _parse_bool(cfg.get("enabled"), True),
+        "start": _parse_hhmm(cfg.get("start"), DEFAULT_QUIET_HOURS["start"]),
+        "end": _parse_hhmm(cfg.get("end"), DEFAULT_QUIET_HOURS["end"]),
+        "mode": mode,
+        "timezone": tz_name,
+    }
+    set_setting("quiet_hours", normalized)
+    return normalized
+
+
+def get_quiet_hours_status(now: datetime | None = None) -> dict[str, Any]:
+    """Evaluate whether quiet hours are currently active in the configured local timezone."""
+    cfg = load_quiet_hours_config()
+    try:
+        tz = ZoneInfo(cfg["timezone"])
+    except Exception:
+        tz = timezone.utc
+
+    if now is None:
+        local_dt = datetime.now(tz)
+    elif now.tzinfo is None:
+        local_dt = now.replace(tzinfo=timezone.utc).astimezone(tz)
+    else:
+        local_dt = now.astimezone(tz)
+
+    start_h, start_m = (int(x) for x in cfg["start"].split(":"))
+    end_h, end_m = (int(x) for x in cfg["end"].split(":"))
+    start_t = dt_time(start_h, start_m)
+    end_t = dt_time(end_h, end_m)
+    cur_t = local_dt.time().replace(second=0, microsecond=0)
+
+    active = False
+    if cfg["enabled"] and start_t != end_t:
+        if start_t < end_t:
+            active = start_t <= cur_t < end_t
+        else:
+            active = (cur_t >= start_t) or (cur_t < end_t)
+
+    return {
+        **cfg,
+        "active": active,
+        "local_time": local_dt.strftime("%H:%M"),
+    }
+
+
 def build_alert_message(alert_data: dict[str, Any]) -> str:
     """Format a human-readable notification message for a price drop alert."""
     name = alert_data.get("product_name", "Okänd produkt")
@@ -197,7 +296,12 @@ def _resolve_notify_services(
     return []
 
 
-def send_price_alert(alert_data: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
+def send_price_alert(
+    alert_data: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    ignore_quiet_hours: bool = False,
+) -> dict[str, Any]:
     """Send a price alert to webhooks and, when authorized, Home Assistant's notify service."""
     cfg = load_notifier_config()
     token = _get_ha_token()
@@ -220,6 +324,13 @@ def send_price_alert(alert_data: dict[str, Any], *, dry_run: bool = False) -> di
     if dry_run or not cfg["webhook_enabled"]:
         result["skipped"] = True
         return result
+
+    qh_status = get_quiet_hours_status() if not ignore_quiet_hours else {"active": False, "mode": "defer"}
+    if qh_status.get("active") and qh_status.get("mode") == "defer":
+        result["skipped"] = True
+        result["deferred_quiet_hours"] = True
+        return result
+    silent_push = bool(qh_status.get("active") and qh_status.get("mode") == "silent")
 
     targets: list[tuple[str, str, dict[str, Any]]] = []
     if cfg["ha_webhook_url"] and cfg.get("use_ha_webhook", True):
@@ -275,11 +386,17 @@ def send_price_alert(alert_data: dict[str, Any], *, dry_run: bool = False) -> di
                             "uri": alert_data["url"],
                         }
                     )
-                    service_payload["data"] = {
+                    mobile_data: dict[str, Any] = {
                         "url": alert_data["url"],
                         "clickAction": alert_data["url"],
                         "actions": actions,
                     }
+                    if silent_push:
+                        mobile_data["push"] = {
+                            "interruption-level": "passive",
+                            "sound": "none",
+                        }
+                    service_payload["data"] = mobile_data
                 try:
                     resp = client.post(
                         notify_url,
